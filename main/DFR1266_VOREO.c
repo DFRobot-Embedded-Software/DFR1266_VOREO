@@ -11,7 +11,8 @@ void app_main(void)
     setRGBColor(RGB_BLACK);
     //autodetectSlotMapping();
     initAudioDoa();
-    //initSpeechRecog();
+    initSpeechRecog();
 
 }
 
+ 

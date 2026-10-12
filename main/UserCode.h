@@ -15,7 +15,7 @@
 /* Kalman parameters for angle smoothing */
 #define KALMAN_Q_ANGLE  0.001f
 #define KALMAN_Q_RATE   0.01f
-#define KALMAN_R_MEAS   2.0f  
+#define KALMAN_R_MEAS   2.0f 
 
 extern float angle;
 
@@ -43,6 +43,12 @@ void initAudioDoa(void);
  * @brief 自动检测TDM槽位到物理麦克风的映射关系
  */
 void autodetectSlotMapping(void);
+
+
+/**
+ * @brief 设置唤醒词
+ */
+void setWakeWord(const char *wake_word);
 
 
 #ifdef __cplusplus

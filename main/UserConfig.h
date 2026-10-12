@@ -25,6 +25,7 @@
 #define GTA_UART_RX_GPIO                39
 
 #define UART_BAUDRATE                   9600
+#define GTA_UART_BAUDRATE               115200
 #define UART_BUF_SIZE                   1024
 
 #define USERI2C_ADDRESS                 0x1f

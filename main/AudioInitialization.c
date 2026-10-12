@@ -156,8 +156,12 @@ static int i2sInit(uint8_t port, codec_i2s_pin_t *i2s_pin, i2s_clock_src_t clk_s
     }
 #endif
     ESP_ERROR_CHECK(ret);
-    // For tx master using duplex mode
-    i2s_channel_enable(i2s_keep[port]->tx_handle);
+    if (i2s_keep[port]->tx_handle) {
+        ESP_ERROR_CHECK(i2s_channel_enable(i2s_keep[port]->tx_handle));
+    }
+    if (i2s_keep[port]->rx_handle) {
+        ESP_ERROR_CHECK(i2s_channel_enable(i2s_keep[port]->rx_handle));
+    }
 
     return ret;
 }
@@ -171,10 +175,14 @@ static int i2sDeinit(uint8_t port)
     if (i2s_keep[port] == NULL) {
         return 0;
     }
-    i2s_channel_disable(i2s_keep[port]->tx_handle);
-    i2s_channel_disable(i2s_keep[port]->rx_handle);
-    i2s_del_channel(i2s_keep[port]->tx_handle);
-    i2s_del_channel(i2s_keep[port]->rx_handle);
+    if (i2s_keep[port]->tx_handle) {
+        i2s_channel_disable(i2s_keep[port]->tx_handle);
+        i2s_del_channel(i2s_keep[port]->tx_handle);
+    }
+    if (i2s_keep[port]->rx_handle) {
+        i2s_channel_disable(i2s_keep[port]->rx_handle);
+        i2s_del_channel(i2s_keep[port]->rx_handle);
+    }
     free(i2s_keep[port]);
     i2s_keep[port] = NULL;
     return 0;

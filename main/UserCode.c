@@ -14,10 +14,14 @@
 #include "esp_mn_speech_commands.h"
 #include "dsps_fft2r.h"
 #include <string.h>
+#include "esp_rom_gpio.h"
+#include "driver/gpio.h"
+#include "hal/gpio_hal.h"
 
 #include "AudioInitialization.h"
 
 #include "esp_dsp.h"
+#include "esp_timer.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -115,6 +119,14 @@ void initMIC(void)
 void feedTask(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
+    
+    // 检查参数有效性
+    if (!afe_data || !afe_handle) {
+        ESP_LOGE(TAG, "feedTask: afe_data 或 afe_handle 为 NULL");
+        vTaskDelete(NULL);
+        return;
+    }
+    
     int audio_chunksize = afe_handle->get_feed_chunksize(afe_data);
     int nch = afe_handle->get_feed_channel_num(afe_data);
     ESP_LOGI(TAG, "Feed channel number: %d", audio_chunksize);
@@ -148,11 +160,24 @@ void feedTask(void *arg)
 
         memcpy(audio_data, i2s_buff_32, audio_data_size);
 
-        // Send pointer to queue (receiver will free the memory); timeout 1 tick to avoid blocking
-        if(xQueueSend(audio_queue, &audio_data, 1) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to send audio data to queue");
-            free(audio_data);
-            continue;
+        // Send pointer to queue (receiver will free the memory)
+        // 如果队列满，丢弃最旧的数据（使用 Overwrite 模式）或增加超时时间
+        BaseType_t queue_result = xQueueSend(audio_queue, &audio_data, pdMS_TO_TICKS(10));
+        if (queue_result != pdPASS) {
+            // 队列满，尝试覆盖最旧的数据
+            int32_t *old_data = NULL;
+            if (xQueueReceive(audio_queue, &old_data, 0) == pdPASS) {
+                // 成功取出旧数据，释放它
+                if (old_data) {
+                    free(old_data);
+                }
+                // 再次尝试发送
+                queue_result = xQueueSend(audio_queue, &audio_data, 0);
+            }
+            if (queue_result != pdPASS) {
+                ESP_LOGW(TAG, "队列满，丢弃音频数据帧");
+                free(audio_data);
+            }
         }
         // Convert 32-bit to 16-bit: extract valid bits (31:8) and shift right by 14 bits
         // This extracts bits 31:14 which contains the valid audio data
@@ -165,7 +190,7 @@ void feedTask(void *arg)
         }
         
         // Feed 16-bit data to AFE (AFE requires int16_t*)
-        //afe_handle->feed(afe_data, i2s_buff_16);
+        afe_handle->feed(afe_data, i2s_buff_16);
         vTaskDelay(1);
     }
     if (i2s_buff_32) {
@@ -186,65 +211,124 @@ void feedTask(void *arg)
 void detectTask(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
+    
+    // 检查参数有效性
+    if (!afe_data || !afe_handle) {
+        ESP_LOGE(TAG, "detectTask: afe_data 或 afe_handle 为 NULL");
+        vTaskDelete(NULL);
+        return;
+    }
+    
     int afe_chunksize = afe_handle->get_fetch_chunksize(afe_data);
-    // #if ESP_MN_CH_MODEL
-    // char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
-    // #endif
-    // #if ESP_MN_EN_MODEL
-    // char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
-    // #endif
-    // esp_mn_iface_t *multinet = esp_mn_handle_from_name(mn_name);
-    // model_iface_data_t *model_data = multinet->create(mn_name, 6000);
-    // multinet->set_det_threshold(model_data, 0.1);
-    // esp_mn_commands_alloc(multinet, model_data);
-    // esp_mn_commands_clear();
-    // // esp_mn_commands_add(1, "ni hao xiao zhi");
-    // // esp_mn_commands_add(1, "xiao zhi xiao hao");
-    // esp_mn_commands_add(1, "xiao ai tong xue");
-    // esp_mn_commands_update();
-    // esp_mn_active_commands_print();
+    
+    // MultiNet 初始化（可选，如果不需要可以注释掉）
+    static esp_mn_iface_t *multinet = NULL;
+    static model_iface_data_t *model_data = NULL;
+    
+    #if ESP_MN_CH_MODEL || ESP_MN_EN_MODEL
+    char *mn_name = NULL;
+    #if ESP_MN_CH_MODEL
+    mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
+    #endif
+    #if ESP_MN_EN_MODEL
+    if (!mn_name) {
+        mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
+    }
+    #endif
+    
+    if (mn_name) {
+        multinet = esp_mn_handle_from_name(mn_name);
+        if (multinet) {
+            model_data = multinet->create(mn_name, 8000);
+            if (model_data) {
+                //multinet->set_det_threshold(model_data, 0.5);
+                esp_mn_commands_alloc(multinet, model_data);
+                esp_mn_commands_clear();
+                //esp_mn_commands_add(1, "kai deng");
+                esp_mn_commands_add(1, "xiao zhi ni hao");
+                //esp_mn_commands_add(1, "kai deng");
+                esp_mn_commands_update();
+                //esp_mn_active_commands_print();
+            } else {
+                ESP_LOGE(TAG, "multinet->create 失败");
+            }
+        } else {
+            ESP_LOGE(TAG, "esp_mn_handle_from_name 失败，mn_name=%s", mn_name ? mn_name : "NULL");
+        }
+    } else {
+        ESP_LOGW(TAG, "未找到 MultiNet 模型，跳过 MultiNet 初始化");
+    }
+    #endif
     printf("------------detect start------------\n");
-    uint8_t wakeup_flag = 0;
+    
+    // 等待 AFE ring buffer 初始化完成（等待 feedTask 开始喂数据）
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    uint8_t wakeup_flag = 1;
+    uint32_t detect_counter = 0; // 用于减少 multinet->detect() 调用频率
     while (1) {
         // 频繁调用 fetch() 以避免 AFE 环形缓冲区溢出
-        afe_fetch_result_t* res = afe_handle->fetch(afe_data);
-        if (!res || res->ret_value == ESP_FAIL) {
-            printf("fetch error!\n");
+        if (!afe_handle || !afe_data) {
+            ESP_LOGE(TAG, "detectTask: afe_handle 或 afe_data 变为 NULL");
             break;
         }
-        if (res->wakeup_state == WAKENET_DETECTED) {
-            printf("wakeword detected\n");
-	        printf("model index:%d, word index:%d\n", res->wakenet_model_index, res->wake_word_index);
-            printf("-----------LISTENING-----------\n");
+        afe_fetch_result_t* res = afe_handle->fetch(afe_data);
+        if (!res || res->ret_value == ESP_FAIL) {
+            // 出错时立即继续，不要延迟，避免缓冲区积压
+            // 如果缓冲区满，频繁调用 fetch() 可以更快清空缓冲区
+            continue; // 继续循环而不是退出
         }
-
-        // if (wakeup_flag) {
-        //     esp_mn_state_t mn_state = multinet->detect(model_data, res->data);
-        //     if (mn_state == ESP_MN_STATE_DETECTING) {
-        //         //vTaskDelay(1);  // 添加延迟，避免CPU占用过高导致看门狗超时
-        //         //break;
-        //     }
-        //     if (mn_state == ESP_MN_STATE_DETECTED) {
-        //         esp_mn_results_t *mn_result = multinet->get_results(model_data);
-        //         for (int i = 0; i < mn_result->num; i++) {
-        //             printf("TOP %d, command_id: %d, phrase_id: %d, string:%s prob: %f\n", 
-        //             i+1, mn_result->command_id[i], mn_result->phrase_id[i], mn_result->string, mn_result->prob[i]);
-        //         }
-        //         printf("\n-----------listening-----------\n");
-        //         //wakeup_flag = 0;
-        //     }
-        //     // if (mn_state == ESP_MN_STATE_TIMEOUT) {
-        //     //     esp_mn_results_t *mn_result = multinet->get_results(model_data);
-        //     //     printf("timeout, string:%s\n", mn_result->string);
-        //     //     //afe_handle->enable_wakenet(afe_data);
-        //     //     wakeup_flag = 0;
-        //     //     printf("\n-----------awaits to be waken up-----------\n");
-        //     //     continue;
-        //     //}
+        // if (res->wakeup_state == WAKENET_DETECTED) {
+        //     printf("wakeword detected\n");
+	    //     printf("model index:%d, word index:%d\n", res->wakenet_model_index, res->wake_word_index); 
+        //     printf("-----------LISTENING-----------\n");
+        //     afe_handle->disable_wakenet(afe_data);
+        //     wakeup_flag = 1;
         // }
-        
-        // 最小延迟，只用于让出 CPU，保持高频率的 fetch 调用
-        vTaskDelay(1);
+        // vTaskDelay(pdMS_TO_TICKS(1));
+        if (wakeup_flag && multinet && model_data) {
+            // multinet->detect() 是计算密集操作，执行时间较长
+            // 减少调用频率：每 2 次 fetch 才调用一次 detect，降低 CPU 占用
+            detect_counter++;
+            if (detect_counter >= 2) {
+                detect_counter = 0;
+                esp_mn_state_t mn_state = multinet->detect(model_data, res->data);
+                
+                // 在 detect() 调用后立即让出 CPU，避免看门狗超时
+                //vTaskDelay(pdMS_TO_TICKS(1));
+                
+                // if (mn_state == ESP_MN_STATE_DETECTING) {
+                //     // 检测中，继续处理
+                // }
+                if (mn_state == ESP_MN_STATE_DETECTED) {
+                    esp_mn_results_t *mn_result = multinet->get_results(model_data);
+                    if (mn_result) {
+                        for (int i = 0; i < mn_result->num; i++) {
+                            printf("TOP %d, command_id: %d, phrase_id: %d, string:%s prob: %f\n", 
+                            i+1, mn_result->command_id[i], mn_result->phrase_id[i], mn_result->string, mn_result->prob[i]);
+                        }
+                        gpio_set_level(GAT_WAKEUP_INT_GPIO, 0);
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        gpio_set_level(GAT_WAKEUP_INT_GPIO, 1); 
+                        printf("\n-----------listening-----------\n");
+                    }
+                    //wakeup_flag = 0;
+                }
+                if (mn_state == ESP_MN_STATE_TIMEOUT) {
+                    esp_mn_results_t *mn_result = multinet->get_results(model_data);
+                    if (mn_result) {
+                        printf("timeout, string:%s\n", mn_result->string);
+                    }
+                    //afe_handle->enable_wakenet(afe_data);
+                    //wakeup_flag = 0;
+                    printf("\n-----------awaits to be waken up-----------\n");
+                    continue;
+                }
+            }
+        } else {
+            // 没有唤醒或 MultiNet 未初始化，使用 taskYIELD() 保持高频率 fetch
+            taskYIELD(); // 让出 CPU，但立即返回，不延迟
+        }
     }
     printf("detect exit\n");
     vTaskDelete(NULL);
@@ -256,23 +340,47 @@ void detectTask(void *arg)
 void initSpeechRecog(void)
 {
     models = esp_srmodel_init("model");
+    if (!models) {
+        ESP_LOGE(TAG, "esp_srmodel_init 失败");
+        return;
+    }
 #ifdef ES7243E 
     afe_config_t *afe_config = afe_config_init("MM", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
 #endif
 #ifdef ES7210
-    afe_config_t *afe_config = afe_config_init("MMNR", models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    afe_config_t *afe_config = afe_config_init("MMNN", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
 #endif 
-    // if (afe_config) {
-    //     // 禁用WakeNet，仅使用MultiNet
-    //     afe_config->wakenet_init = false;
-    //     afe_config->aec_init = false;  // 如果不需要回声消除
-    // }
+    if (!afe_config) {
+        ESP_LOGE(TAG, "afe_config_init 失败");
+        return;
+    }
+    if (afe_config) {
+        // 禁用WakeNet，仅使用MultiNet
+        afe_config->wakenet_init = false;
+        afe_config->aec_init = false;  // 如果不需要回声消除
+        afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    }
     afe_handle = esp_afe_handle_from_config(afe_config);
+    if (!afe_handle) {
+        ESP_LOGE(TAG, "esp_afe_handle_from_config 失败");
+        afe_config_free(afe_config);
+        return;
+    }
     esp_afe_sr_data_t *afe_data = afe_handle->create_from_config(afe_config);
+    if (!afe_data) {
+        ESP_LOGE(TAG, "afe_handle->create_from_config 失败");
+        afe_config_free(afe_config);
+        return;
+    }
     afe_config_free(afe_config);
 
-    xTaskCreatePinnedToCore(detectTask, "detect", 8 * 1024, (void*)afe_data, 5, NULL, 1);
-    xTaskCreatePinnedToCore(feedTask, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
+    // 先启动 feedTask，确保有数据喂入后再启动 detectTask
+    // feedTask 优先级稍低，确保 detectTask 能及时处理数据
+    xTaskCreatePinnedToCore(feedTask, "feed", 8 * 1024, (void*)afe_data, 4, NULL, 0);
+    // 延迟启动 detectTask，确保 AFE ring buffer 已初始化
+    vTaskDelay(pdMS_TO_TICKS(100));
+    // detectTask 优先级更高，确保能及时调用 fetch() 清空缓冲区
+    xTaskCreatePinnedToCore(detectTask, "detect", 8 * 1024, (void*)afe_data, 6, NULL, 1);
 }
 
 
@@ -742,12 +850,18 @@ static void processOneFrame() {
 
     float norm_x = tau_x_f / max_tau;
     float norm_y = tau_y_f / max_tau;
-    float az = atan2f(norm_y, norm_x) * 180.0f / M_PI; // 0度指向 +x
+    float az = atan2f(norm_y, norm_x) * 180.0f / M_PI; // 0度指向 +x.
     if (az < 0) az += 360.0f;
     angle = az;
 
-    ESP_LOGI(TAG, "DOA angle=%.1f deg  tau_x=%.2fus tau_y=%.2fus  energy=%.3e",
-        angle, tau_x*1e6f, tau_y*1e6f, total_e);
+    static int64_t last_log_us = 0;
+    int64_t now_us = esp_timer_get_time();
+    float dt_ms = (last_log_us > 0) ? (float)(now_us - last_log_us) / 1000.0f : 0.0f;
+    float hz = (dt_ms > 0.0f) ? (1000.0f / dt_ms) : 0.0f;
+    last_log_us = now_us;
+
+    ESP_LOGI(TAG, "t=%.3fs dt=%.2fms(%.2fHz) DOA angle=%.1f deg  tau_x=%.2fus tau_y=%.2fus  energy=%.3e",
+        (double)now_us / 1e6, dt_ms, hz, angle, tau_x*1e6f, tau_y*1e6f, total_e);
 }
 
 /**
@@ -759,31 +873,30 @@ void audioDoaTask(void *arg)
     size_t bytes_to_read = sizeof(int32_t) * FRAME_SIZE * CHANNELS;
     while (1) {
         
-        // int32_t *audio_data = NULL;
-        // // Receive pointer from queue
-        // if(xQueueReceive(audio_queue, &audio_data, portMAX_DELAY) != pdPASS) {
-        //     ESP_LOGE(TAG, "Failed to receive audio data from queue");
-        //     continue;
-        // }
+        int32_t *audio_data = NULL;
+        // Receive pointer from queue
+        if(xQueueReceive(audio_queue, &audio_data, portMAX_DELAY) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to receive audio data from queue");
+            continue;
+        }
         
-        // if (!audio_data) {
-        //     ESP_LOGE(TAG, "Received NULL audio data pointer");
-        //     continue;
-        // }
+        if (!audio_data) {
+            ESP_LOGE(TAG, "Received NULL audio data pointer");
+            continue;
+        }
         
-        // // TODO: Process audio_data for DOA calculation
-        // // float *doa_data = malloc(...);
-        // // ... DOA processing ...
+        // 将队列接收的数据复制到处理缓冲区
+        memcpy(raw_i2s_buf, audio_data, bytes_to_read);
         
-        // // Free the memory allocated by feed_Task
-        // free(audio_data);
-        // audio_data = NULL;
-
-
-        esp_codec_dev_read(record_dev, raw_i2s_buf, bytes_to_read);
+        // 处理音频帧进行DOA计算
         processOneFrame();
+        
+        // 释放内存（由 feedTask 分配）
+        free(audio_data);
+        audio_data = NULL;
 
-        vTaskDelay(50);
+        // 减少延迟，提高处理速度，避免队列积压
+        vTaskDelay(1);
     }
     vTaskDelete(NULL);
 }
@@ -798,14 +911,20 @@ void initAudioDoa(void)
     dsps_fft2r_init_fc32(NULL, FRAME_SIZE);
     // 创建队列用于存储指针(int32_t*)，而不是数据本身
     // 这对于大数据块更高效
-    // audio_queue = xQueueCreate(10, sizeof(int32_t*));
-    // if (!audio_queue) {
-    //     ESP_LOGE(TAG, "创建音频队列失败");
-    //     return;
-    // }
+    // 增加队列大小，减少队列满的情况
+    audio_queue = xQueueCreate(20, sizeof(int32_t*));
+    if (!audio_queue) {
+        ESP_LOGE(TAG, "创建音频队列失败");
+        return;
+    }
     //xTaskCreatePinnedToCore(audioDoaTask, "audio_doa", 8 * 1024, NULL, 5, NULL, 0);
     xTaskCreate(audioDoaTask, "audio_doa_task", 8*1024, NULL, 5, NULL);
 }
 
 
-
+void setWakeWord(const char *wake_word)
+{
+    esp_mn_commands_clear();
+    esp_mn_commands_add(1, wake_word);
+    esp_mn_commands_update();
+}

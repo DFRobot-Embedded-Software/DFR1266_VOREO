@@ -15,6 +15,7 @@
 #include "driver/i2c_slave.h"
 #include <string.h>
 #include "esp_log.h"
+#include "UserCode.h"
 
 #define TAG "USER_PERIPHERAL"
 
@@ -27,6 +28,7 @@ static gat_data_list_t *gatDataList = NULL;
 
 static int commMode = UART_MODE;
 extern float angle; 
+static uint8_t asrState = 0;
 
 static i2c_slave_dev_handle_t slave_handle = NULL;
 
@@ -43,6 +45,8 @@ static uint8_t i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
 static uint8_t i2cRxBuffer[UART_READ_BUF_SIZE];  // 接收缓冲区
 static uint16_t i2cRxBufferLen = 0;              // 当前接收缓冲区中的数据长度
 static uint16_t i2cExpectedPacketLen = 0;         // 期望的数据包总长度（根据包头和长度字段计算）
+
+static bool isOpen = false;
 
 // I2C接收数据结构
 typedef struct {
@@ -157,6 +161,17 @@ static void sendBuf(uint8_t *data, size_t len, uint8_t cmd)
     }
 }
 
+static void sendBufToGAT(uint8_t *data, size_t len)
+{
+    static uint8_t send_buffer[GAT_DATA_BUFFER_MAX_SIZE + 2];
+    size_t total_len = len + 2;
+    
+    send_buffer[0] = 0XDF;
+    memcpy(send_buffer + 1, data, len);
+    send_buffer[len + 1] = 0xFF;
+    uart_write_bytes(GTA_UART_PORT, send_buffer, total_len);
+
+}
 /**
  * @brief 解析用户UART数据（状态机实现）
  * @param data 接收到的数据缓冲区
@@ -165,6 +180,7 @@ static void sendBuf(uint8_t *data, size_t len, uint8_t cmd)
 static void userParseData(const uint8_t *data, size_t len)
 {
     uint8_t sendData = 0;
+    static uint8_t sendBufData[2];
     if (!data || len == 0) {
         ESP_LOGW(TAG, "无效的用户数据：空指针或长度为零");
         return;
@@ -186,8 +202,9 @@ static void userParseData(const uint8_t *data, size_t len)
         }else if(userParseState.cmdState == UART_CMD_CMD){
             switch(data[i])
             {
+                // ESP_LOGI(TAG, "USER command received: 0x%02X", data[i]);
                 case USER_UART_CMD_QUERY_TEXT:
-                    ESP_LOGI(TAG, "USER query text command received");
+                    //ESP_LOGI(TAG, "USER query text command received");
                     userParseState.cmdState = USER_UART_CMD_HEAD;
                     
                     // 检查是否有完整的USER_UART_CMD_SEND_TEXT节点
@@ -195,7 +212,7 @@ static void userParseData(const uint8_t *data, size_t len)
                     if (gatDataList) {
                         gat_data_node_t *current = gatDataList->head;
                         while (current) {
-                            if (current->cmd == USER_UART_CMD_SEND_TEXT && 
+                            if (current->cmd == GAT_CMD_ASR_DATA && 
                                 gatDataNodeIsComplete(current) && 
                                 current->data && 
                                 current->received_len > 0) {
@@ -209,6 +226,7 @@ static void userParseData(const uint8_t *data, size_t len)
                     break;
                 case USER_UART_CMD_GET_TEXT:
                     ESP_LOGI(TAG, "USER get text command received");
+                    setRGBColor(RGB_BLACK);
                     userParseState.cmdState = USER_UART_CMD_HEAD;
                     // 从链表中查找完整的USER_UART_CMD_SEND_TEXT节点
                     if (gatDataList) {
@@ -216,7 +234,7 @@ static void userParseData(const uint8_t *data, size_t len)
                         // 遍历链表查找USER_UART_CMD_SEND_TEXT命令的完整节点
                         gat_data_node_t *current = gatDataList->head;
                         while (current) {
-                            if (current->cmd == USER_UART_CMD_SEND_TEXT && 
+                            if (current->cmd == GAT_CMD_ASR_DATA && 
                                 gatDataNodeIsComplete(current) && 
                                 current->data && 
                                 current->received_len > 0) {
@@ -273,7 +291,6 @@ static void userParseData(const uint8_t *data, size_t len)
                     break;
                 case USER_UART_CMD_ANGLE:
                     userParseState.cmdState = USER_UART_CMD_HEAD;   
-                    uint8_t sendBufData[2];
                     sendBufData[0] = ((uint16_t)angle >> 8) & 0xff;
                     sendBufData[1] = ((uint16_t)angle & 0xff);
                     sendBuf(sendBufData, 2, USER_UART_CMD_ANGLE);   
@@ -281,8 +298,49 @@ static void userParseData(const uint8_t *data, size_t len)
                 case USER_UART_CMD_BEGIN:
                     ESP_LOGI(TAG, "USER begin command received");
                     userParseState.cmdState = USER_UART_CMD_HEAD;
-                    sendData = 1;
+                    if(isOpen)
+                    {
+                        ESP_LOGI(TAG, "USER begin command received, but already open");
+                        sendData = 1;
+                    }else{
+                        ESP_LOGI(TAG, "USER begin command received, not open");
+                        sendData = 0;
+                    }
+                    
                     sendBuf(&sendData, 1, USER_UART_CMD_BEGIN);
+                    break;
+                case USER_UART_CMD_SET_ASR:
+                    ESP_LOGI(TAG, "USER set ASR command received, expected data length: %d", userParseState.dataLen);
+                    // 如果有数据需要接收，创建节点并进入数据接收状态
+                    if (userParseState.dataLen > 0) {
+                        if (gatDataList) {
+                            gat_data_node_t *node = gatDataNodeCreate(USER_UART_CMD_SET_ASR, userParseState.dataLen);
+                            if (node) {
+                                gatDataListAdd(gatDataList, node);
+                                userParseState.cmdState = USER_UART_CMD_DATA;
+                                ESP_LOGI(TAG, "Created USER ASR data node, expected length: %d", userParseState.dataLen);
+                            } else {
+                                ESP_LOGE(TAG, "Failed to create USER ASR data node, reset state");
+                                userParseState.cmdState = USER_UART_CMD_HEAD;
+                                userParseState.dataLen = 0;
+                            }
+                        } else {
+                            ESP_LOGE(TAG, "GAT data list not initialized, reset state");
+                            userParseState.cmdState = USER_UART_CMD_HEAD;
+                            userParseState.dataLen = 0;
+                        }
+                    } else {
+                        // 没有数据，直接返回
+                        ESP_LOGW(TAG, "USER set ASR command with zero data length");
+                        userParseState.cmdState = USER_UART_CMD_HEAD;
+                    }
+                    break;
+                case USER_UART_CMD_GET_ASR_STATE:
+                    ESP_LOGI(TAG, "USER get ASR state command received");
+                    userParseState.cmdState = USER_UART_CMD_HEAD;
+                    sendBufData[0] = (uint8_t)asrState;
+                    sendBuf(sendBufData, 1, USER_UART_CMD_GET_ASR_STATE);
+                    asrState = 0;
                     break;
                 default:
                     ESP_LOGW(TAG, "Unknown USER command received: 0x%02X, reset state", data[i]);
@@ -290,10 +348,10 @@ static void userParseData(const uint8_t *data, size_t len)
                     break;
             }
         } else if(userParseState.cmdState == USER_UART_CMD_DATA){
-            // 接收文本数据并存储到节点中
+            // 接收数据并存储到节点中（支持 SEND_TEXT 和 SET_ASR）
             if (gatDataList) {
                 gat_data_node_t *node = gatDataListGetIncomplete(gatDataList);
-                if (node && node->cmd == USER_UART_CMD_SEND_TEXT) {
+                if (node && (node->cmd == USER_UART_CMD_SEND_TEXT || node->cmd == USER_UART_CMD_SET_ASR)) {
                     int appended = gatDataNodeAppend(node, &data[i], 1);
                     if (appended > 0) {
                         if (gatDataNodeIsComplete(node)) {
@@ -337,7 +395,7 @@ static void i2cSlaveTask(void *pvParameters)
         if(xQueueReceive(slaveReceiveQueue, &event, portMAX_DELAY) == pdTRUE){
             if(event == I2C_SLAVE_EVT_TX){
                 ESP_LOGI(TAG, "I2C从机请求发送数据");
-                setRGBColor(RGB_YELLOW);
+                //setRGBColor(RGB_YELLOW);
                 
                 if(i2cSlaveSendStatic == I2C_SLAVE_SEND_STATIC_LEN){
                     if(last_rx_cmd == I2C_SLAVE_CMD_GET_LEN){
@@ -351,7 +409,7 @@ static void i2cSlaveTask(void *pvParameters)
                         last_rx_cmd = 0;  // 清除命令
                     }else{
                         ESP_LOGW(TAG, "I2C从机请求发送数据失败，未收到GET_LEN命令");
-                        setRGBColor(RGB_BLUE);
+                        //setRGBColor(RGB_BLUE);
                         uint8_t errorData[2] = {0xff, 0xff};
                         i2c_slave_write(slave_handle, errorData, 2, &write_len, pdMS_TO_TICKS(1000));
                         i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
@@ -386,14 +444,19 @@ static void i2cSlaveTask(void *pvParameters)
                 }
                 else{
                     ESP_LOGW(TAG, "I2C从机请求发送数据失败，状态错误");
-                    setRGBColor(RGB_BLUE);
+                    //setRGBColor(RGB_BLUE);
                     uint8_t errorData[2] = {0xff, 0xff};
                     write_len = i2c_slave_write(slave_handle, errorData, 2, &write_len, pdMS_TO_TICKS(1000));
                     i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
                 }
             }else if(event == I2C_SLAVE_EVT_RX){
                 ESP_LOGI(TAG, "I2C从机接收数据成功，长度: %d", i2cSlaveDataLen);
-                setRGBColor(RGB_GREEN);
+                //setRGBColor(RGB_GREEN);
+                if(i2cSlaveData[0] == 0x00){
+                    ESP_LOGI(TAG, "python send data");
+                    i2cSlaveDataLen = 0;
+                    continue;
+                }
                 
                 // 检查是否是GET_LEN命令（单字节命令，且缓冲区为空）
                 if(i2cSlaveDataLen == 1 && i2cRxBufferLen == 0 && i2cSlaveData[0] == I2C_SLAVE_CMD_GET_LEN){
@@ -606,15 +669,18 @@ static void gtaParseData(const uint8_t *data, size_t len)
                 setRGBColor(RGB_GREEN);
                 gatParseState.lastCmd = GAT_CMD_WAKEUP;
                 gatParseState.cmdState = GAT_UART_CMD_END;
+                asrState = 1;
                 break;
             case GAT_CMD_DETECTED:
                 ESP_LOGI(TAG, "GTA detected command received");
                 setRGBColor(RGB_BLUE);
                 gatParseState.lastCmd = GAT_CMD_DETECTED;
                 gatParseState.cmdState = GAT_UART_CMD_END;
+                asrState = 2;
                 break;
             case GAT_CMD_ASR_DATA:
                 gatParseState.cmdState = UART_CMD_LEN_H;
+                gatParseState.lastCmd = GAT_CMD_ASR_DATA;
                 gatParseState.dataLen = 0;
                 ESP_LOGI(TAG, "GTA ASR data command received");
                 break;
@@ -622,6 +688,18 @@ static void gtaParseData(const uint8_t *data, size_t len)
                 ESP_LOGI(TAG, "GTA read error command received");
                 gatParseState.lastCmd = GAT_CMD_READ_ERROR;
                 gatParseState.cmdState = GAT_UART_CMD_END;
+                break;
+            case GAT_CMD_OPEN:
+                ESP_LOGI(TAG, "GTA open command received");
+                gatParseState.lastCmd = GAT_CMD_OPEN;
+                gatParseState.cmdState = GAT_UART_CMD_END;
+                if(isOpen)
+                {
+                    ESP_LOGI(TAG, "GTA open command received, but already open");
+                    break;
+                }else{  
+                    isOpen = true;
+                }
                 break;
             default:
                 ESP_LOGW(TAG, "Unknown GTA command received: 0x%02X, reset state", data[i]);
@@ -954,12 +1032,55 @@ static void gtaUartTask(void *pvParameters)
         // 轮询模式：读取可用数据（非阻塞）
         // 最多读取UART_READ_BUF_SIZE字节，如果数据不足则立即返回
         int len = uart_read_bytes(GTA_UART_PORT, dtmp, UART_READ_BUF_SIZE, 0);
-        if (len > 0) {
+        if(len > 0)
+        {
             gtaParseData(dtmp, len);
-        } else {
-            // 没有数据可用，让出CPU
-            vTaskDelay(1);
         }
+        vTaskDelay(1);
+    }
+}
+
+static void userTask(void *pvParameters)
+{
+    while (1)
+    {
+        if (gatDataList) {
+            gat_data_node_t *node = NULL;
+            // 遍历链表查找USER_UART_CMD_SEND_TEXT命令的完整节点
+            gat_data_node_t *current = gatDataList->head;
+            while (current) {
+                if ((current->cmd == USER_UART_CMD_SEND_TEXT || current->cmd == USER_UART_CMD_SET_ASR) && 
+                    gatDataNodeIsComplete(current) && 
+                    current->data && 
+                    current->received_len > 0) {
+                    node = current;
+                    break;
+                }
+                current = current->next;
+            }
+
+            if (node && node->cmd == USER_UART_CMD_SEND_TEXT) {
+                // 发送数据
+                sendBufToGAT(node->data, node->received_len);
+                ESP_LOGI(TAG, "Sent text data, length: %d", node->received_len);
+                // 从链表中移除已发送的节点（gatDataListRemove内部会释放节点）
+                gatDataListRemove(gatDataList, node);
+            } else if (node && node->cmd == USER_UART_CMD_SET_ASR) {
+                ESP_LOGI(TAG, "Set ASR data, length: %d", node->received_len);
+                // 确保字符串以 \0 结尾
+                char *wake_word = (char*)malloc(node->received_len + 1);
+                if (wake_word) {
+                    memcpy(wake_word, node->data, node->received_len);
+                    wake_word[node->received_len] = '\0';  // 添加字符串结束符
+                    setWakeWord(wake_word);
+                    free(wake_word);
+                } else {
+                    ESP_LOGE(TAG, "Failed to allocate memory for wake word");
+                }
+                gatDataListRemove(gatDataList, node);
+            }
+        }
+        vTaskDelay(1);
     }
 }
 
@@ -1007,7 +1128,7 @@ int peripheralInit(void)
     }
     ESP_LOGI(TAG, "GAT数据链表初始化成功");
     uart_config_t config = {
-        .baud_rate = UART_BAUDRATE,
+        .baud_rate = GTA_UART_BAUDRATE,
         .data_bits = UART_DATA_BITS,
         .stop_bits = UART_STOP_BITS,
         .parity = UART_PARITY,
@@ -1018,16 +1139,26 @@ int peripheralInit(void)
     uart_driver_install(GTA_UART_PORT, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0);
     uart_param_config(GTA_UART_PORT, &config);
     uart_set_pin(GTA_UART_PORT, GTA_UART_TX_GPIO, GTA_UART_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    gpio_set_pull_mode(GTA_UART_TX_GPIO, GPIO_PULLUP_ONLY);
     xTaskCreate(gtaUartTask, "gtaUartTask", 8*1024, NULL, 10, NULL);
+    xTaskCreate(userTask, "userTask", 8*1024, NULL, 10, NULL);
     // 配置GPIO为输入模式
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_DISABLE,      // 不使用中断
         .mode = GPIO_MODE_INPUT,             // 输入模式
-        .pin_bit_mask = (1ULL << MODE_GPIO)|(1ULL << GAT_VDD_EN_GPIO)|(1ULL << GAT_RESET_GPIO)|(1ULL << GAT_SPI0_DO_GPIO),
+        .pin_bit_mask = (1ULL << MODE_GPIO) | (1ULL << GAT_VDD_EN_GPIO) | (1ULL << GAT_RESET_GPIO) | (1ULL << GAT_SPI0_DO_GPIO | 1ULL << GAT_WAKEUP_GPIO) | 1ULL << 44,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_ENABLE     // 启动内部上拉（适合按键）
     };
     gpio_config(&io_conf);
+
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = (1ULL << GAT_WAKEUP_INT_GPIO | 1ULL <<43);
+    gpio_config(&io_conf);
+    gpio_set_level(GAT_WAKEUP_INT_GPIO, 1);
+    gpio_set_level(1ULL <<43, 1);
+    //gpio_set_level(GAT_WAKEUP_GPIO, 1); 
+
 
     commMode = gpio_get_level(MODE_GPIO);
     if (commMode == I2C_MODE) {
@@ -1067,6 +1198,7 @@ int peripheralInit(void)
         // 创建I2C数据处理任务（处理接收到的数据）
         xTaskCreate(i2cDataProcessTask, "i2cDataProcessTask", 8*1024, NULL, 5, NULL);
     } else {
+        config.baud_rate = UART_BAUDRATE;
         uart_driver_install(USERUART_PORT, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0);
         uart_param_config(USERUART_PORT, &config);
         uart_set_pin(USERUART_PORT, USERUART_TX_SDA_GPIO, USERUART_RX_SCL_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
