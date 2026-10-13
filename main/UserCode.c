@@ -151,34 +151,31 @@ void feedTask(void *arg)
     while (1) {
         // Read 32-bit audio data from codec
         esp_codec_dev_read(record_dev, i2s_buff_32, audio_data_size);
-        // Allocate buffer for queue (receiver will free it)
-        int32_t *audio_data = malloc(audio_data_size);
-        if (!audio_data) {
-            ESP_LOGE(TAG, "Failed to malloc audio data");
-            continue;
-        }
 
-        memcpy(audio_data, i2s_buff_32, audio_data_size);
-
-        // Send pointer to queue (receiver will free the memory)
-        // 如果队列满，丢弃最旧的数据（使用 Overwrite 模式）或增加超时时间
-        BaseType_t queue_result = xQueueSend(audio_queue, &audio_data, pdMS_TO_TICKS(10));
-        if (queue_result != pdPASS) {
-            // 队列满，尝试覆盖最旧的数据
-            int32_t *old_data = NULL;
-            if (xQueueReceive(audio_queue, &old_data, 0) == pdPASS) {
-                // 成功取出旧数据，释放它
-                if (old_data) {
-                    free(old_data);
+        // DOA 队列仅在 initAudioDoa() 创建后使用；未启用时跳过，避免对 NULL 队列发送
+        if (audio_queue) {
+            int32_t *audio_data = malloc(audio_data_size);
+            if (audio_data) {
+                memcpy(audio_data, i2s_buff_32, audio_data_size);
+                BaseType_t queue_result = xQueueSend(audio_queue, &audio_data, pdMS_TO_TICKS(10));
+                if (queue_result != pdPASS) {
+                    int32_t *old_data = NULL;
+                    if (xQueueReceive(audio_queue, &old_data, 0) == pdPASS) {
+                        if (old_data) {
+                            free(old_data);
+                        }
+                        queue_result = xQueueSend(audio_queue, &audio_data, 0);
+                    }
+                    if (queue_result != pdPASS) {
+                        ESP_LOGW(TAG, "队列满，丢弃音频数据帧");
+                        free(audio_data);
+                    }
                 }
-                // 再次尝试发送
-                queue_result = xQueueSend(audio_queue, &audio_data, 0);
-            }
-            if (queue_result != pdPASS) {
-                ESP_LOGW(TAG, "队列满，丢弃音频数据帧");
-                free(audio_data);
+            } else {
+                ESP_LOGE(TAG, "Failed to malloc audio data");
             }
         }
+
         // Convert 32-bit to 16-bit: extract valid bits (31:8) and shift right by 14 bits
         // This extracts bits 31:14 which contains the valid audio data
         // Data format: bits 31:8 are valid, bits 7:0 are zero
