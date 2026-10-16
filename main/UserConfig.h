@@ -24,6 +24,11 @@
 #define GTA_UART_TX_GPIO                38
 #define GTA_UART_RX_GPIO                39
 
+#define SNR9912_UART_PORT               UART_NUM_0 //SNR9912VR UART串口
+#define SNR9912_UART_TX_GPIO            43
+#define SNR9912_UART_RX_GPIO            44
+#define SNR9912_UART_BAUDRATE           9600
+
 #define UART_BAUDRATE                   9600
 #define GTA_UART_BAUDRATE               115200
 #define UART_BUF_SIZE                   1024

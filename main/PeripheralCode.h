@@ -17,6 +17,8 @@
 #define RGB_GREEN                       rgb_from_code(0xff00)
 #define RGB_BLACK                       rgb_from_code(0x00)
 #define RGB_YELLOW                      rgb_from_code(0xffff00)
+#define RGB_CYAN                        rgb_from_code(0x00ffff)
+#define RGB_RED                         rgb_from_code(0xff0000)
 
 
 

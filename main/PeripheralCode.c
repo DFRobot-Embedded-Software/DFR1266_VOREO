@@ -76,6 +76,7 @@ static struct {
 
 static QueueHandle_t userUartQueue = NULL;
 static QueueHandle_t gtaUartQueue = NULL;
+static void snr9912UartInit(void);
 
 static led_strip_t strip =
 {
@@ -241,7 +242,7 @@ static void userParseData(const uint8_t *data, size_t len)
                     break;
                 case USER_UART_CMD_GET_TEXT:
                     ESP_LOGI(TAG, "USER get text command received");
-                    setRGBColor(RGB_BLACK);
+                    //setRGBColor(RGB_BLACK);
                     userParseState.cmdState = USER_UART_CMD_HEAD;
                     // 从链表中查找完整的USER_UART_CMD_SEND_TEXT节点
                     if (gatDataList) {
@@ -681,14 +682,14 @@ static void gtaParseData(const uint8_t *data, size_t len)
            {
             case GAT_CMD_WAKEUP:
                 ESP_LOGI(TAG, "GTA wakeup command received");
-                setRGBColor(RGB_GREEN);
+                //setRGBColor(RGB_GREEN);
                 gatParseState.lastCmd = GAT_CMD_WAKEUP;
                 gatParseState.cmdState = GAT_UART_CMD_END;
                 asrState = 1;
                 break;
             case GAT_CMD_DETECTED:
                 ESP_LOGI(TAG, "GTA detected command received");
-                setRGBColor(RGB_BLUE);
+                //setRGBColor(RGB_BLUE);
                 gatParseState.lastCmd = GAT_CMD_DETECTED;
                 gatParseState.cmdState = GAT_UART_CMD_END;
                 asrState = 2;
@@ -1177,17 +1178,17 @@ int peripheralInit(void)
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_DISABLE,      // 不使用中断
         .mode = GPIO_MODE_INPUT,             // 输入模式
-        .pin_bit_mask = (1ULL << MODE_GPIO) | (1ULL << GAT_VDD_EN_GPIO) | (1ULL << GAT_RESET_GPIO) | (1ULL << GAT_SPI0_DO_GPIO | 1ULL << GAT_WAKEUP_GPIO) | 1ULL << 44,
+        .pin_bit_mask = (1ULL << MODE_GPIO) | (1ULL << GAT_VDD_EN_GPIO) | (1ULL << GAT_RESET_GPIO) | (1ULL << GAT_SPI0_DO_GPIO | 1ULL << GAT_WAKEUP_GPIO),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_ENABLE     // 启动内部上拉（适合按键）
     };
     gpio_config(&io_conf);
 
     io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (1ULL << GAT_WAKEUP_INT_GPIO | 1ULL <<43);
+    io_conf.pin_bit_mask = (1ULL << GAT_WAKEUP_INT_GPIO);
     gpio_config(&io_conf);
     gpio_set_level(GAT_WAKEUP_INT_GPIO, 1);
-    gpio_set_level(1ULL <<43, 1);
+    snr9912UartInit();
     //gpio_set_level(GAT_WAKEUP_GPIO, 1); 
 
 
@@ -1238,6 +1239,143 @@ int peripheralInit(void)
     }
     
     return ret;
+}
+
+typedef enum {
+    RGB_FX_OFF = 0,
+    RGB_FX_CYAN,
+    RGB_FX_YELLOW_SLOW,
+    RGB_FX_GREEN_TWICE,
+    RGB_FX_RED_TWICE,
+} rgb_fx_mode_t;
+
+static volatile rgb_fx_mode_t rgbFxMode = RGB_FX_OFF;
+static volatile uint32_t rgbFxSeq = 0;
+
+static void rgbApplyCmd(uint8_t cmd)
+{
+    switch (cmd) {
+    case 0x55:
+        rgbFxMode = RGB_FX_CYAN;
+        break;
+    case 0x01:
+        rgbFxMode = RGB_FX_YELLOW_SLOW;
+        break;
+    case 0x02:
+        rgbFxMode = RGB_FX_GREEN_TWICE;
+        break;
+    case 0x03:
+    case 0x04:
+    case 0x05:
+        rgbFxMode = RGB_FX_RED_TWICE;
+        break;
+    default:
+        ESP_LOGW(TAG, "未知RGB命令: 0x%02X", cmd);
+        return;
+    }
+    rgbFxSeq++;
+    ESP_LOGI(TAG, "RGB命令: 0x%02X", cmd);
+}
+
+static void rgbFxTask(void *arg)
+{
+    uint32_t seen = 0;
+
+    while (1) {
+        rgb_fx_mode_t mode = rgbFxMode;
+        uint32_t seq = rgbFxSeq;
+
+        if (mode == RGB_FX_CYAN) {
+            setRGBColor(RGB_CYAN);
+            seen = seq;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        } else if (mode == RGB_FX_YELLOW_SLOW) {
+            seen = seq;
+            setRGBColor(RGB_YELLOW);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            if (rgbFxSeq != seen) {
+                continue;
+            }
+            setRGBColor(RGB_BLACK);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        } else if (mode == RGB_FX_GREEN_TWICE || mode == RGB_FX_RED_TWICE) {
+            rgb_t color = (mode == RGB_FX_GREEN_TWICE) ? RGB_GREEN : RGB_RED;
+            seen = seq;
+            for (int i = 0; i < 2; i++) {
+                if (rgbFxSeq != seen) {
+                    break;
+                }
+                setRGBColor(color);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                if (rgbFxSeq != seen) {
+                    break;
+                }
+                setRGBColor(RGB_BLACK);
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+            while (rgbFxSeq == seen) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        } else {
+            setRGBColor(RGB_BLACK);
+            seen = seq;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+}
+
+static void snr9912UartTask(void *arg)
+{
+    uint8_t buf[64];
+    int state = 0;
+    uint8_t data = 0;
+
+    while (1) {
+        int n = uart_read_bytes(SNR9912_UART_PORT, buf, sizeof(buf), pdMS_TO_TICKS(20));
+        for (int i = 0; i < n; i++) {
+            uint8_t b = buf[i];
+            if (state == 0) {
+                if (b == 0xF4) {
+                    state = 1;
+                }
+            } else if (state == 1) {
+                if (b == 0xA1) {
+                    state = 2;
+                } else {
+                    state = (b == 0xF4) ? 1 : 0;
+                }
+            } else if (state == 2) {
+                data = b;
+                state = 3;
+            } else {
+                if (b == 0xFB) {
+                    rgbApplyCmd(data);
+                }
+                state = (b == 0xF4) ? 1 : 0;
+            }
+        }
+    }
+}
+
+static void snr9912UartInit(void)
+{
+    if (!uart_is_driver_installed(SNR9912_UART_PORT)) {
+        uart_config_t config = {
+            .baud_rate = SNR9912_UART_BAUDRATE,
+            .data_bits = UART_DATA_BITS,
+            .stop_bits = UART_STOP_BITS,
+            .parity = UART_PARITY,
+            .flow_ctrl = UART_FLOW_CTRL,
+            .source_clk = UART_SOURCE_CLK,
+        };
+        ESP_ERROR_CHECK(uart_driver_install(SNR9912_UART_PORT, UART_BUF_SIZE, 0, 0, NULL, 0));
+        ESP_ERROR_CHECK(uart_param_config(SNR9912_UART_PORT, &config));
+    }
+    ESP_ERROR_CHECK(uart_set_pin(SNR9912_UART_PORT, SNR9912_UART_TX_GPIO, SNR9912_UART_RX_GPIO,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    xTaskCreate(snr9912UartTask, "snr9912UartTask", 3072, NULL, 5, NULL);
+    xTaskCreate(rgbFxTask, "rgbFxTask", 3072, NULL, 4, NULL);
+    ESP_LOGI(TAG, "SNR9912 UART GPIO%d/GPIO%d %d", SNR9912_UART_TX_GPIO, SNR9912_UART_RX_GPIO, SNR9912_UART_BAUDRATE);
 }
 
 /**
