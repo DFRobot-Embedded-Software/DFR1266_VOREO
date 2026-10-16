@@ -336,6 +336,10 @@ void detectTask(void *arg)
  */
 void initSpeechRecog(void)
 {
+#if !LOCAL_ASR_WAKEUP_ENABLE
+    ESP_LOGI(TAG, "ESP32语音识别唤醒已关闭 (LOCAL_ASR_WAKEUP_ENABLE=0)");
+    return;
+#endif
     models = esp_srmodel_init("model");
     if (!models) {
         ESP_LOGE(TAG, "esp_srmodel_init 失败");
@@ -921,6 +925,13 @@ void initAudioDoa(void)
 
 void setWakeWord(const char *wake_word)
 {
+#if !LOCAL_ASR_WAKEUP_ENABLE
+    (void)wake_word;
+    return;
+#endif
+    if (!wake_word) {
+        return;
+    }
     esp_mn_commands_clear();
     esp_mn_commands_add(1, wake_word);
     esp_mn_commands_update();

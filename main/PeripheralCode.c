@@ -85,7 +85,7 @@ static led_strip_t strip =
     .gpio = RGB_GPIO,
     .buf = NULL,
 #ifdef LED_STRIP_BRIGHTNESS
-    .brightness = 100,
+    .brightness = 25, // 亮度范围0-255
 #endif
 };
 

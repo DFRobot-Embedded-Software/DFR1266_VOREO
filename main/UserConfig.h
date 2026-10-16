@@ -4,6 +4,8 @@
 #define ES7210
 //#define ES7243E
 
+#define LOCAL_ASR_WAKEUP_ENABLE         0 // 1=开启ESP32语音识别唤醒，0=关闭
+
 #define ESP_MN_CH_MODEL 1 //使能中文自定义唤醒词
 #define ESP_MN_EN_MODEL 0 //使能英文自定义唤醒词
 
