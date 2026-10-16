@@ -12,7 +12,6 @@ void app_main(void)
     //autodetectSlotMapping();
     // initAudioDoa();
     initSpeechRecog();
-
 }
 
  

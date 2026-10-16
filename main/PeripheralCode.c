@@ -161,16 +161,31 @@ static void sendBuf(uint8_t *data, size_t len, uint8_t cmd)
     }
 }
 
-static void sendBufToGAT(uint8_t *data, size_t len)
+/** 主机→GTA：DF + cmd + payload + FF */
+static void sendBufToGAT(uint8_t cmd, const uint8_t *data, size_t len)
 {
-    static uint8_t send_buffer[GAT_DATA_BUFFER_MAX_SIZE + 2];
-    size_t total_len = len + 2;
-    
-    send_buffer[0] = 0XDF;
-    memcpy(send_buffer + 1, data, len);
-    send_buffer[len + 1] = 0xFF;
-    uart_write_bytes(GTA_UART_PORT, send_buffer, total_len);
+    static uint8_t send_buffer[GAT_DATA_BUFFER_MAX_SIZE + 3];
+    if (len > GAT_DATA_BUFFER_MAX_SIZE) {
+        ESP_LOGE(TAG, "sendBufToGAT: payload too long (%u)", (unsigned)len);
+        return;
+    }
 
+    size_t total_len = len + 3;
+    send_buffer[0] = GAT_HOST_HEAD;
+    send_buffer[1] = cmd;
+    if (data && len > 0) {
+        memcpy(send_buffer + 2, data, len);
+    }
+    send_buffer[2 + len] = GAT_CMD_END;
+
+    ESP_LOGI(TAG, "sendBufToGAT TX: %02X %02X ... %02X (len=%u)",
+             send_buffer[0], send_buffer[1], send_buffer[total_len - 1], (unsigned)total_len);
+
+    int written = uart_write_bytes(GTA_UART_PORT, send_buffer, total_len);
+    if (written < 0 || (size_t)written < total_len) {
+        ESP_LOGW(TAG, "sendBufToGAT: write %d/%u cmd=0x%02X", written, (unsigned)total_len, cmd);
+    }
+    uart_wait_tx_done(GTA_UART_PORT, pdMS_TO_TICKS(200));
 }
 /**
  * @brief 解析用户UART数据（状态机实现）
@@ -701,6 +716,21 @@ static void gtaParseData(const uint8_t *data, size_t len)
                     isOpen = true;
                 }
                 break;
+            case GAT_CMD_ASR_TIMEOUT:
+                ESP_LOGI(TAG, "GTA ASR timeout (0xA4)");
+                gatParseState.lastCmd = GAT_CMD_ASR_TIMEOUT;
+                gatParseState.cmdState = GAT_UART_CMD_END;
+                break;
+            case GAT_CMD_SPEED_ACK:
+                ESP_LOGI(TAG, "GTA speed set ack (0xA5)");
+                gatParseState.lastCmd = GAT_CMD_SPEED_ACK;
+                gatParseState.cmdState = GAT_UART_CMD_END;
+                break;
+            case GAT_CMD_VOLUME_ACK:
+                ESP_LOGI(TAG, "GTA volume set ack (0xA6)");
+                gatParseState.lastCmd = GAT_CMD_VOLUME_ACK;
+                gatParseState.cmdState = GAT_UART_CMD_END;
+                break;
             default:
                 ESP_LOGW(TAG, "Unknown GTA command received: 0x%02X, reset state", data[i]);
                 gatParseState.cmdState = GAT_UART_CMD_HEAD0; // 重置状态，避免卡住
@@ -1060,9 +1090,9 @@ static void userTask(void *pvParameters)
             }
 
             if (node && node->cmd == USER_UART_CMD_SEND_TEXT) {
-                // 发送数据
-                sendBufToGAT(node->data, node->received_len);
-                ESP_LOGI(TAG, "Sent text data, length: %d", node->received_len);
+                // 用户文本作为 TTS 播报发给 GTA：DF A0 + UTF-8 + FF
+                sendBufToGAT(GAT_HOST_CMD_TTS, node->data, node->received_len);
+                ESP_LOGI(TAG, "Sent TTS to GTA, length: %d", node->received_len);
                 // 从链表中移除已发送的节点（gatDataListRemove内部会释放节点）
                 gatDataListRemove(gatDataList, node);
             } else if (node && node->cmd == USER_UART_CMD_SET_ASR) {
@@ -1138,8 +1168,9 @@ int peripheralInit(void)
     // 初始化GTA UART
     uart_driver_install(GTA_UART_PORT, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0);
     uart_param_config(GTA_UART_PORT, &config);
-    uart_set_pin(GTA_UART_PORT, GTA_UART_TX_GPIO, GTA_UART_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    gpio_set_pull_mode(GTA_UART_TX_GPIO, GPIO_PULLUP_ONLY);
+    // 注意：uart_set_pin 之后不要再 gpio_set_pull_mode/gpio_config 同一脚，否则可能打断 UART 矩阵（此前只改 TX 会导致只收不发）
+    ESP_ERROR_CHECK(uart_set_pin(GTA_UART_PORT, GTA_UART_TX_GPIO, GTA_UART_RX_GPIO,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     xTaskCreate(gtaUartTask, "gtaUartTask", 8*1024, NULL, 10, NULL);
     xTaskCreate(userTask, "userTask", 8*1024, NULL, 10, NULL);
     // 配置GPIO为输入模式
@@ -1218,6 +1249,35 @@ int setRGBColor(rgb_t color)
 {
     led_strip_set_pixel(&strip, 0, color);
     return led_strip_flush(&strip);
+}
+
+bool gatIsOpen(void)
+{
+    return isOpen;
+}
+
+void setGatVolume(uint8_t volume)
+{
+    if (volume > 0x0F) {
+        volume = 0x0F;
+    }
+    sendBufToGAT(GAT_HOST_CMD_VOLUME, &volume, 1);
+    ESP_LOGI(TAG, "setGatVolume: 0x%02X", volume);
+}
+
+void sendTextToGAT(const char *text)
+{
+    if (!text || text[0] == '\0') {
+        ESP_LOGW(TAG, "sendTextToGAT: empty text");
+        return;
+    }
+    size_t len = strlen(text);
+    if (len > GAT_DATA_BUFFER_MAX_SIZE) {
+        ESP_LOGE(TAG, "sendTextToGAT: text too long (%u)", (unsigned)len);
+        return;
+    }
+    sendBufToGAT(GAT_HOST_CMD_TTS, (const uint8_t *)text, len);
+    ESP_LOGI(TAG, "sendTextToGAT: DF A0 + %u bytes UTF-8 + FF", (unsigned)len);
 }
 
 
