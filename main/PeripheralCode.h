@@ -40,13 +40,14 @@
 #define GAT_UART_CMD_END                  (6)
 #define USER_UART_CMD_DATA                (7)
 
+/** 模组→主机：帧头 FD + 00 + 命令 + FF */
 #define GAT_CMD_HEAD0                    (0xFD)  //头0（模组→主机）
 #define GAT_CMD_HEAD1                    (0x00)  //头1
 #define GAT_CMD_END                      (0xFF) //结束符
 #define GAT_CMD_WAKEUP                   (0xA0) //唤醒通知
 #define GAT_CMD_DETECTED                 (0xA1) //识别完成
 #define GAT_CMD_ASR_DATA                 (0xA2) //ASR文本
-#define GAT_CMD_OPEN                     (0xA3) //初始化完成
+#define GAT_CMD_OPEN                     (0xA3) //GTA初始化完成后应答
 #define GAT_CMD_ASR_TIMEOUT              (0xA4) //ASR超时
 #define GAT_CMD_SPEED_ACK                (0xA5) //语速设置应答
 #define GAT_CMD_VOLUME_ACK               (0xA6) //音量设置应答
@@ -196,5 +197,8 @@ void sendTextToGAT(const char *text);
 
 /** 向 GTA 设置音量（帧：DF A1 + vol + FF，vol=0x00~0x0F） */
 void setGatVolume(uint8_t volume);
+
+/** 向 GTA 设置语速（帧：DF A2 + speed + FF，speed=0x00~0x0F） */
+void setGatSpeed(uint8_t speed);
 
 #endif

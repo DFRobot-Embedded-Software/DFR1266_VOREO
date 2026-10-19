@@ -19,6 +19,9 @@
 
 #define TAG "USER_PERIPHERAL"
 
+/* 上电后直接向 GTA 发送音量/语速/TTS 三条命令做联调；测完改 0 */
+#define GTA_HOST_CMD_SELFTEST           1
+
 // CRC16-CCITT 多项式 (0x1021)
 #define CRC16_POLYNOMIAL 0x1021
 #define CRC16_INITIAL_VALUE 0xFFFF
@@ -351,6 +354,18 @@ static void userParseData(const uint8_t *data, size_t len)
                         userParseState.cmdState = USER_UART_CMD_HEAD;
                     }
                     break;
+                case USER_UART_CMD_TTS_SPEED:
+                    ESP_LOGI(TAG, "USER TTS speed command, dataLen=%d", userParseState.dataLen);
+                    userParseState.lastCmd = USER_UART_CMD_TTS_SPEED;
+                    if (userParseState.dataLen == 1) {
+                        userParseState.cmdState = USER_UART_CMD_DATA;
+                    } else {
+                        ESP_LOGW(TAG, "USER TTS speed expects 1 byte, got len=%d", userParseState.dataLen);
+                        userParseState.cmdState = USER_UART_CMD_HEAD;
+                        userParseState.dataLen = 0;
+                        userParseState.lastCmd = 0;
+                    }
+                    break;
                 case USER_UART_CMD_GET_ASR_STATE:
                     ESP_LOGI(TAG, "USER get ASR state command received");
                     userParseState.cmdState = USER_UART_CMD_HEAD;
@@ -364,6 +379,14 @@ static void userParseData(const uint8_t *data, size_t len)
                     break;
             }
         } else if(userParseState.cmdState == USER_UART_CMD_DATA){
+            // 单字节语速：立即转发到 GTA（DF A2 + speed + FF）
+            if (userParseState.lastCmd == USER_UART_CMD_TTS_SPEED) {
+                setGatSpeed(data[i]);
+                userParseState.cmdState = USER_UART_CMD_HEAD;
+                userParseState.dataLen = 0;
+                userParseState.lastCmd = 0;
+                continue;
+            }
             // 接收数据并存储到节点中（支持 SEND_TEXT 和 SET_ASR）
             if (gatDataList) {
                 gat_data_node_t *node = gatDataListGetIncomplete(gatDataList);
@@ -711,7 +734,7 @@ static void gtaParseData(const uint8_t *data, size_t len)
                 gatParseState.cmdState = GAT_UART_CMD_END;
                 if(isOpen)
                 {
-                    ESP_LOGI(TAG, "GTA open command received, but already open");
+                    ESP_LOGI(TAG, "GTA open command received, already open");
                     break;
                 }else{  
                     isOpen = true;
@@ -1178,7 +1201,7 @@ int peripheralInit(void)
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_DISABLE,      // 不使用中断
         .mode = GPIO_MODE_INPUT,             // 输入模式
-        .pin_bit_mask = (1ULL << MODE_GPIO) | (1ULL << GAT_VDD_EN_GPIO) | (1ULL << GAT_RESET_GPIO) | (1ULL << GAT_SPI0_DO_GPIO | 1ULL << GAT_WAKEUP_GPIO),
+        .pin_bit_mask = (1ULL << MODE_GPIO) | (1ULL << GAT_VDD_EN_GPIO) | (1ULL << GAT_RESET_GPIO) | ( 1ULL << GAT_WAKEUP_GPIO),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_ENABLE     // 启动内部上拉（适合按键）
     };
@@ -1189,7 +1212,6 @@ int peripheralInit(void)
     gpio_config(&io_conf);
     gpio_set_level(GAT_WAKEUP_INT_GPIO, 1);
     snr9912UartInit();
-    //gpio_set_level(GAT_WAKEUP_GPIO, 1); 
 
 
     commMode = gpio_get_level(MODE_GPIO);
@@ -1237,7 +1259,32 @@ int peripheralInit(void)
         ESP_LOGI(TAG, "USERUART_PORT is initialized");
         xTaskCreate(userUartTask, "userUartTask", 8*1024, NULL, 5, NULL);
     }
-    
+
+#if GTA_HOST_CMD_SELFTEST
+    /* 等 GTA 上报 0xA3 后再测；超时仍发送便于抓串口 */
+    {
+        const int wait_ms = 10000;
+        int elapsed = 0;
+        while (!isOpen && elapsed < wait_ms) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            elapsed += 100;
+        }
+        ESP_LOGI(TAG, "GTA selftest: isOpen=%d after %d ms", (int)isOpen, elapsed);
+
+        /* DF A1 + 0x08 + FF */
+        setGatVolume(0x0F);
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        /* DF A2 + 0x08 + FF */
+        setGatSpeed(0x01);
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        /* DF A0 + UTF-8「今天天气怎么样」+ FF */
+        sendTextToGAT("今天天气怎么样");
+        ESP_LOGI(TAG, "GTA selftest done (vol/speed/TTS)");
+    }
+#endif
+
     return ret;
 }
 
@@ -1399,8 +1446,19 @@ void setGatVolume(uint8_t volume)
     if (volume > 0x0F) {
         volume = 0x0F;
     }
+    /* DF A1 + vol(0x00~0x0F) + FF */
     sendBufToGAT(GAT_HOST_CMD_VOLUME, &volume, 1);
-    ESP_LOGI(TAG, "setGatVolume: 0x%02X", volume);
+    ESP_LOGI(TAG, "setGatVolume: DF A1 %02X FF", volume);
+}
+
+void setGatSpeed(uint8_t speed)
+{
+    if (speed > 0x0F) {
+        speed = 0x0F;
+    }
+    /* DF A2 + speed(0x00~0x0F) + FF */
+    sendBufToGAT(GAT_HOST_CMD_SPEED, &speed, 1);
+    ESP_LOGI(TAG, "setGatSpeed: DF A2 %02X FF", speed);
 }
 
 void sendTextToGAT(const char *text)
@@ -1414,6 +1472,7 @@ void sendTextToGAT(const char *text)
         ESP_LOGE(TAG, "sendTextToGAT: text too long (%u)", (unsigned)len);
         return;
     }
+    /* DF A0 + UTF-8 + FF */
     sendBufToGAT(GAT_HOST_CMD_TTS, (const uint8_t *)text, len);
     ESP_LOGI(TAG, "sendTextToGAT: DF A0 + %u bytes UTF-8 + FF", (unsigned)len);
 }

@@ -12,17 +12,18 @@
 #define RGB_GPIO                        9 //RGB指示灯引脚
 #define MODE_GPIO                       21 //通信模式选择按键引脚
 
-#define GAT_WAKEUP_INT_GPIO             47 //GAT唤醒引脚
-#define GAT_VDD_EN_GPIO                 7 //GAT电源使能引脚
-#define GAT_RESET_GPIO                  45 //GAT复位引脚
-#define GAT_SPI0_DO_GPIO                12 //GATSPI0数据输出引脚
-#define GAT_WAKEUP_GPIO                 8 
+#define GAT_WAKEUP_INT_GPIO             47 //语音识别功能唤醒同WAKEUP按键， 低有效
 
-#define USERUART_PORT                   UART_NUM_2
+#define GAT_VDD_EN_GPIO                 7 //GAT电源使能引脚，默认输出高
+#define GAT_RESET_GPIO                  45 //GAT复位引脚，上拉输入
+#define GAT_SPI0_DO_GPIO                12 //未使用
+#define GAT_WAKEUP_GPIO                 8 //低功耗唤醒引脚，默认输出高
+
+#define USERUART_PORT                   UART_NUM_2 //gravity接口
 #define USERUART_TX_SDA_GPIO            14
 #define USERUART_RX_SCL_GPIO            13
 
-#define GTA_UART_PORT                   UART_NUM_1
+#define GTA_UART_PORT                   UART_NUM_1 //GTA接口
 #define GTA_UART_TX_GPIO                38
 #define GTA_UART_RX_GPIO                39
 
