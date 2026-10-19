@@ -12,10 +12,10 @@
 #define RGB_GPIO                        9 //RGB指示灯引脚
 #define MODE_GPIO                       21 //通信模式选择按键引脚
 
-#define GAT_WAKEUP_INT_GPIO             47 //语音识别功能唤醒同WAKEUP按键， 低有效
+#define GAT_WAKEUP_INT_GPIO             47 //语音识别功能唤醒同WAKEUP按键
 
 #define GAT_VDD_EN_GPIO                 7 //GAT电源使能引脚，默认输出高
-#define GAT_RESET_GPIO                  45 //GAT复位引脚，上拉输入
+#define GAT_RESET_GPIO                  45 //GAT复位引脚，输入不上拉
 #define GAT_SPI0_DO_GPIO                12 //未使用
 #define GAT_WAKEUP_GPIO                 8 //低功耗唤醒引脚，默认输出高
 
