@@ -120,8 +120,9 @@ app_main()
 | `USER_UART_CMD_ANGLE` | `0x04` | 角度 |
 | `USER_UART_CMD_DISTANCE` | `0x05` | 距离 |
 | `USER_UART_CMD_SET_ASR` | `0x06` | 设置 ASR |
-| `USER_UART_CMD_TTS_SPEED` | `0x07` | TTS 语速 |
+| `USER_UART_CMD_TTS_SPEED` | `0x07` | TTS 语速（1 字节，`0x00`~`0x0F`） |
 | `USER_UART_CMD_GET_ASR_STATE` | `0x08` | ASR 状态 |
+| `USER_UART_CMD_TTS_VOLUME` | `0x09` | TTS 音量（1 字节，`0x00`~`0x0F`） |
 
 用户帧头 `0x55`，发送侧带 CRC16。I2C 从机另支持长度查询等（`I2C_SLAVE_CMD_*`），按长度/数据分包回传。
 

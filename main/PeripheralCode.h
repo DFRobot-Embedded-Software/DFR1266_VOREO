@@ -69,8 +69,9 @@
 #define USER_UART_CMD_ANGLE              (0x04) //角度命令
 #define USER_UART_CMD_DISTANCE           (0x05) //距离命令
 #define USER_UART_CMD_SET_ASR            (0x06) //设置ASR命令
-#define USER_UART_CMD_TTS_SPEED          (0x07) //TTS速度命令
+#define USER_UART_CMD_TTS_SPEED          (0x07) //TTS速度命令 0x00~0x0F
 #define USER_UART_CMD_GET_ASR_STATE      (0x08) //获取ASR状态命令
+#define USER_UART_CMD_TTS_VOLUME         (0x09) //TTS音量命令 0x00~0x0F
 
 
 #define I2C_SLAVE_CMD_ERROR               (0x20)

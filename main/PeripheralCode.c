@@ -371,6 +371,18 @@ static void userParseData(const uint8_t *data, size_t len)
                         userParseState.lastCmd = 0;
                     }
                     break;
+                case USER_UART_CMD_TTS_VOLUME:
+                    ESP_LOGI(TAG, "USER TTS volume command, dataLen=%d", userParseState.dataLen);
+                    userParseState.lastCmd = USER_UART_CMD_TTS_VOLUME;
+                    if (userParseState.dataLen == 1) {
+                        userParseState.cmdState = USER_UART_CMD_DATA;
+                    } else {
+                        ESP_LOGW(TAG, "USER TTS volume expects 1 byte, got len=%d", userParseState.dataLen);
+                        userParseState.cmdState = USER_UART_CMD_HEAD;
+                        userParseState.dataLen = 0;
+                        userParseState.lastCmd = 0;
+                    }
+                    break;
                 case USER_UART_CMD_GET_ASR_STATE:
                     ESP_LOGI(TAG, "USER get ASR state command received");
                     userParseState.cmdState = USER_UART_CMD_HEAD;
@@ -387,6 +399,14 @@ static void userParseData(const uint8_t *data, size_t len)
             // 单字节语速：立即转发到 GTA（DF A2 + speed + FF）
             if (userParseState.lastCmd == USER_UART_CMD_TTS_SPEED) {
                 setGatSpeed(data[i]);
+                userParseState.cmdState = USER_UART_CMD_HEAD;
+                userParseState.dataLen = 0;
+                userParseState.lastCmd = 0;
+                continue;
+            }
+            // 单字节音量：立即转发到 GTA（DF A1 + volume + FF）
+            if (userParseState.lastCmd == USER_UART_CMD_TTS_VOLUME) {
+                setGatVolume(data[i]);
                 userParseState.cmdState = USER_UART_CMD_HEAD;
                 userParseState.dataLen = 0;
                 userParseState.lastCmd = 0;
@@ -1250,19 +1270,19 @@ int peripheralInit(void)
         //     vTaskDelay(pdMS_TO_TICKS(100));
         //     elapsed += 100;
         // }
-        // ESP_LOGI(TAG, "GTA selftest: isOpen=%d after %d ms", (int)isOpen, elapsed);
+        ESP_LOGI(TAG, "GTA selftest: isOpen=%d after %d ms", (int)isOpen, elapsed);
 
         /* DF A1 + 0x08 + FF */
         setGatVolume(0x0F);
         vTaskDelay(pdMS_TO_TICKS(200));
 
         /* DF A2 + 0x08 + FF */
-        setGatSpeed(0x04);
+        setGatSpeed(0x01);
         vTaskDelay(pdMS_TO_TICKS(200));
 
         /* DF A0 + UTF-8「今天天气怎么样」+ FF */
-        // sendTextToGAT("今天天气怎么样");
-        // ESP_LOGI(TAG, "GTA selftest done (vol/speed/TTS)");
+        sendTextToGAT("今天天气怎么样");
+        ESP_LOGI(TAG, "GTA selftest done (vol/speed/TTS)");
     }
 #endif
 
