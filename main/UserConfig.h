@@ -4,10 +4,7 @@
 #define ES7210
 //#define ES7243E
 
-#define LOCAL_ASR_WAKEUP_ENABLE         0 // 1=开启ESP32语音识别唤醒，0=关闭
-
-#define ESP_MN_CH_MODEL 1 //使能中文自定义唤醒词
-#define ESP_MN_EN_MODEL 0 //使能英文自定义唤醒词
+#define LOCAL_DOA_ENABLE                1 // 1=开启声源定位(DOA)，0=关闭
 
 #define RGB_GPIO                        9 //RGB指示灯引脚
 #define MODE_GPIO                       21 //通信模式选择按键引脚

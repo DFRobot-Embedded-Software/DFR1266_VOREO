@@ -10,8 +10,7 @@ void app_main(void)
     peripheralInit();
     //setRGBColor(RGB_BLACK);
     //autodetectSlotMapping();
-    // initAudioDoa();
-    // initSpeechRecog();
+#if LOCAL_DOA_ENABLE
+    initAudioDoa();
+#endif
 }
-
- 

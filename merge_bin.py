@@ -15,11 +15,10 @@ FLASH_FILES = [
     ("build/bootloader/bootloader.bin", 0x0),
     ("build/partition_table/partition-table.bin", 0x8000),
     ("build/DFR1266_VOREO.bin", 0x10000),
-    ("build/srmodels/srmodels.bin", 0x610000),
 ]
 
-# Flash 大小 (16MB)
-FLASH_SIZE = 16 * 1024 * 1024  # 0x1000000
+# Flash 大小 (4MB)
+FLASH_SIZE = 4 * 1024 * 1024  # 0x400000
 
 
 def merge_bin_files(output_file="merged_firmware.bin"):
@@ -74,7 +73,7 @@ def merge_bin_files(output_file="merged_firmware.bin"):
     print()
     print("烧录命令:")
     print(f'  esptool.py -p COM32 -b 460800 --before default_reset --after hard_reset --chip esp32s3 \\')
-    print(f'    write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0 {output_file}')
+    print(f'    write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 {output_file}')
     
     return True
 
@@ -100,4 +99,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

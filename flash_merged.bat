@@ -5,7 +5,7 @@ REM 例如: flash_merged.bat COM32 460800
 
 set COM_PORT=COM32
 set BAUD_RATE=460800
-set FLASH_SIZE=16MB
+set FLASH_SIZE=4MB
 set FLASH_MODE=dio
 set FLASH_FREQ=80m
 

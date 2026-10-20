@@ -30,11 +30,6 @@ extern "C" {
 void initMIC(void);
 
 /**
- * @brief 初始化语音识别系统
- */
-void initSpeechRecog(void);
-
-/**
  * @brief 初始化音频DOA（到达方向）系统
  */
 void initAudioDoa(void);
@@ -43,13 +38,6 @@ void initAudioDoa(void);
  * @brief 自动检测TDM槽位到物理麦克风的映射关系
  */
 void autodetectSlotMapping(void);
-
-
-/**
- * @brief 设置唤醒词
- */
-void setWakeWord(const char *wake_word);
-
 
 #ifdef __cplusplus
 }

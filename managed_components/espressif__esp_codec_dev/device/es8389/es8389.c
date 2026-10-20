@@ -1,8 +1,9 @@
 /*
-* SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO LTD
-*
-* SPDX-License-Identifier: Apache-2.0
-*/
+ * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -10,16 +11,18 @@
 #include "es8389_codec.h"
 #include "es_common.h"
 #include "esp_log.h"
+#include "codec_ref_mgr.h"
 
 #define TAG          "ES8389"
 
 typedef struct {
-    audio_codec_if_t   base;
-    es8389_codec_cfg_t cfg;
-    bool               is_open;
-    bool               enabled;
-    float              hw_gain;
-    bool               use_mclk;
+    audio_codec_if_t    base;
+    es8389_codec_cfg_t  cfg;
+    float               hw_gain;
+    bool                is_open;
+    bool                enabled;
+    bool                use_mclk;
+    bool                no_dac_ref;
 } audio_codec_es8389_t;
 
 /*
@@ -165,6 +168,70 @@ static int es8389_update_bits(audio_codec_es8389_t *codec, uint8_t reg_addr, uin
     return es8389_write_reg(codec, reg_addr, regval);
 }
 
+static uint8_t es8389_pga_gain_byte(es8389_mic_gain_t gain_db, uint8_t mode, uint8_t reverse)
+{
+    return (uint8_t)(((reverse & 1u) << 7) | ((mode & 7u) << 4) | ((uint8_t)gain_db & 0x0Fu));
+}
+
+static es8389_mic_gain_t es8389_float_db_to_mic_gain_enum(float db)
+{
+    es8389_mic_gain_t gain_db = ES8389_MIC_GAIN_0DB;
+    if (db < 6) {
+        gain_db = ES8389_MIC_GAIN_3_5DB;
+    } else if (db < 9) {
+        gain_db = ES8389_MIC_GAIN_6_5DB;
+    } else if (db < 12) {
+        gain_db = ES8389_MIC_GAIN_9_5DB;
+    } else if (db < 15) {
+        gain_db = ES8389_MIC_GAIN_12_5DB;
+    } else if (db < 18) {
+        gain_db = ES8389_MIC_GAIN_15_5DB;
+    } else if (db < 21) {
+        gain_db = ES8389_MIC_GAIN_18_5DB;
+    } else if (db < 24) {
+        gain_db = ES8389_MIC_GAIN_21_5DB;
+    } else if (db < 27) {
+        gain_db = ES8389_MIC_GAIN_24_5DB;
+    } else if (db < 30) {
+        gain_db = ES8389_MIC_GAIN_27_5DB;
+    } else if (db < 33) {
+        gain_db = ES8389_MIC_GAIN_30_5DB;
+    } else if (db < 36) {
+        gain_db = ES8389_MIC_GAIN_33_5DB;
+    } else {
+        gain_db = ES8389_MIC_GAIN_36_5DB;
+    }
+    return gain_db;
+}
+
+static int es8389_apply_mic_pga_gain(audio_codec_es8389_t *codec, uint16_t channel_mask, float db)
+{
+    if (codec == NULL) {
+        return ESP_CODEC_DEV_INVALID_ARG;
+    }
+    if (codec->is_open == false) {
+        ESP_LOGW(TAG, "mic PGA: codec not open");
+        return ESP_CODEC_DEV_WRONG_STATE;
+    }
+    if (channel_mask & ~(ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1))) {
+        ESP_LOGW(TAG, "mic PGA: only ch0/ch1, mask=0x%x", channel_mask);
+        return ESP_CODEC_DEV_INVALID_ARG;
+    }
+    es8389_mic_gain_t gain_db = es8389_float_db_to_mic_gain_enum(db);
+    int ret = 0;
+    if (channel_mask & ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0)) {
+        uint8_t regv = es8389_pga_gain_byte(gain_db, ES8389_ADCL_InputSel, 0);
+        ESP_LOGD(TAG, "Mic L PGA: mask=0x%x db=%.1f enum=%d reg=0x%02x", channel_mask, db, (int)gain_db, (unsigned)regv);
+        ret |= es8389_write_reg(codec, ES8389_PGA1_GAIN_CONTROL_REG0x72, regv);
+    }
+    if (channel_mask & ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1)) {
+        uint8_t regv = es8389_pga_gain_byte(gain_db, ES8389_ADCR_InputSel, 0);
+        ESP_LOGD(TAG, "Mic R PGA: mask=0x%x db=%.1f enum=%d reg=0x%02x", channel_mask, db, (int)gain_db, (unsigned)regv);
+        ret |= es8389_write_reg(codec, ES8389_PGA1_GAIN_CONTROL_REG0x73, regv);
+    }
+    return ret == 0 ? ESP_CODEC_DEV_OK : ESP_CODEC_DEV_WRITE_FAIL;
+}
+
 int es8389_set_bias_standby(audio_codec_es8389_t *codec)
 {
     int ret = es8389_update_bits(codec, ES8389_DAC_CONTROL_REG0x40, 0x03, 0x03);
@@ -267,7 +334,7 @@ static int get_coeff(uint32_t mclk, uint32_t rate)
         }
     }
 
-    return ESP_CODEC_DEV_NOT_FOUND;
+    return -1;
 }
 
 static int es8389_suspend(audio_codec_es8389_t *codec)
@@ -300,6 +367,14 @@ static int es8389_start(audio_codec_es8389_t *codec)
 {
     int ret = ESP_CODEC_DEV_OK;
     ret |= es8389_set_bias_on(codec);
+
+    return ret;
+}
+
+static int es8389_stop(audio_codec_es8389_t *codec)
+{
+    int ret = ESP_CODEC_DEV_OK;
+    ret |= es8389_set_bias_standby(codec);
 
     return ret;
 }
@@ -345,46 +420,24 @@ static int es8389_set_vol(const audio_codec_if_t *h, float db_value)
 static int es8389_set_mic_gain(const audio_codec_if_t *h, float db)
 {
     audio_codec_es8389_t *codec = (audio_codec_es8389_t *)h;
-    if (codec == NULL) {
-        return ESP_CODEC_DEV_INVALID_ARG;
-    }
-    if (codec->is_open == false) {
-        return ESP_CODEC_DEV_WRONG_STATE;
-    }
-    es8389_mic_gain_t gain_db = ES8389_MIC_GAIN_0DB;
-    if (db < 6) {
-        gain_db = ES8389_MIC_GAIN_3_5DB;
-    } else if (db < 9) {
-        gain_db = ES8389_MIC_GAIN_6_5DB;
-    } else if (db < 12) {
-        gain_db = ES8389_MIC_GAIN_9_5DB;
-    } else if (db < 15) {
-        gain_db = ES8389_MIC_GAIN_12_5DB;
-    } else if (db < 18) {
-        gain_db = ES8389_MIC_GAIN_15_5DB;
-    } else if (db < 21) {
-        gain_db = ES8389_MIC_GAIN_18_5DB;
-    } else if (db < 24) {
-        gain_db = ES8389_MIC_GAIN_21_5DB;
-    } else if (db < 27) {
-        gain_db = ES8389_MIC_GAIN_24_5DB;
-    } else if (db < 30) {
-        gain_db = ES8389_MIC_GAIN_27_5DB;
-    } else if (db < 33) {
-        gain_db = ES8389_MIC_GAIN_30_5DB;
-    } else if (db < 36) {
-        gain_db = ES8389_MIC_GAIN_33_5DB;
-    } else {
-        gain_db = ES8389_MIC_GAIN_36_5DB;
-    }
-    int ret = es8389_write_reg(codec, ES8389_PGA1_GAIN_CONTROL_REG0x72, gain_db | (3 << 4));  // MIC gain scale
-    return ret == 0 ? ESP_CODEC_DEV_OK : ESP_CODEC_DEV_WRITE_FAIL;
+    return es8389_apply_mic_pga_gain(codec,
+                                     ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1),
+                                     db);
+}
+
+static int es8389_set_mic_channel_gain(const audio_codec_if_t *h, uint16_t channel_mask, float db)
+{
+    audio_codec_es8389_t *codec = (audio_codec_es8389_t *)h;
+    return es8389_apply_mic_pga_gain(codec, channel_mask, db);
 }
 
 static void es8389_pa_power(audio_codec_es8389_t *codec, es_pa_setting_t pa_setting)
 {
     int16_t pa_pin = codec->cfg.pa_pin;
-    if (pa_pin == -1 || codec->cfg.gpio_if == NULL) {
+    if (pa_pin == -1 || codec->cfg.gpio_if == NULL ||
+        (codec->cfg.codec_mode & ESP_CODEC_DEV_WORK_MODE_DAC) == 0) {
+        ESP_LOGD(TAG, "Skip PA control: pa_pin:%d, gpio_if:%p, codec_mode:%d",
+                 pa_pin, codec->cfg.gpio_if, codec->cfg.codec_mode);
         return;
     }
     if (pa_setting & ES_PA_SETUP) {
@@ -401,7 +454,8 @@ static void es8389_pa_power(audio_codec_es8389_t *codec, es_pa_setting_t pa_sett
 static int es8389_config_sample(audio_codec_es8389_t *codec, int sample_rate, int bits)
 {
     int ret = ESP_CODEC_DEV_OK;
-    int mclk_fre = sample_rate * bits * 2;
+
+    int mclk_fre = sample_rate * bits * (codec->no_dac_ref ? 2 : 4);
     int rate = mclk_fre / sample_rate;
 
     int coeff = get_coeff(mclk_fre, rate);
@@ -436,16 +490,22 @@ static int es8389_config_sample(audio_codec_es8389_t *codec, int sample_rate, in
     return ret == 0 ? ESP_CODEC_DEV_OK : ESP_CODEC_DEV_WRITE_FAIL;
 }
 
+static inline void es8389_apply_cfg(audio_codec_es8389_t *codec, const es8389_codec_cfg_t *codec_cfg)
+{
+    memcpy(&codec->cfg, codec_cfg, sizeof(es8389_codec_cfg_t));
+    if (codec->cfg.mclk_div == 0) {
+        codec->cfg.mclk_div = MCLK_DEFAULT_DIV;
+    }
+    codec->use_mclk = codec_cfg->use_mclk;
+    codec->no_dac_ref = codec_cfg->no_dac_ref;
+}
+
 static int es8389_open(const audio_codec_if_t *h, void *cfg, int cfg_size)
 {
     audio_codec_es8389_t *codec = (audio_codec_es8389_t *)h;
     es8389_codec_cfg_t *codec_cfg = (es8389_codec_cfg_t *)cfg;
     if (codec == NULL || codec_cfg == NULL || codec_cfg->ctrl_if == NULL || cfg_size != sizeof(es8389_codec_cfg_t)) {
         return ESP_CODEC_DEV_INVALID_ARG;
-    }
-    memcpy(&codec->cfg, cfg, sizeof(es8389_codec_cfg_t));
-    if (codec->cfg.mclk_div == 0) {
-        codec->cfg.mclk_div = MCLK_DEFAULT_DIV;
     }
 
     int ret = ESP_CODEC_DEV_OK;
@@ -473,8 +533,8 @@ static int es8389_open(const audio_codec_if_t *h, void *cfg, int cfg_size)
     }
 
     ret |= es8389_write_reg(codec, ES8389_ADC_SP_CONTROL_REG0x23, (int)(0x00 + (0 & 0xC0) + (0 << 2) + (0 & 0x03)));
-    ret |= es8389_write_reg(codec, ES8389_PGA1_GAIN_CONTROL_REG0x72, (int)((1 << 4) + 0));
-    ret |= es8389_write_reg(codec, ES8389_PGA1_GAIN_CONTROL_REG0x73, (int)((1 << 4) + 0));
+    ret |= es8389_write_reg(codec, ES8389_PGA1_GAIN_CONTROL_REG0x72, (int)((ES8389_ADCL_InputSel << 4) + 0));
+    ret |= es8389_write_reg(codec, ES8389_PGA1_GAIN_CONTROL_REG0x73, (int)((ES8389_ADCR_InputSel << 4) + 0));
     ret |= es8389_write_reg(codec, ES8389_CLK_MANAGER_REG0x10, 0xC4);
     ret |= es8389_write_reg(codec, ES8389_MISC_CONTROL_REG0x01, (int)(0x08 + (0 << 7) + (0 << 6) + (0 << 5) + (0 << 0)));
     ret |= es8389_write_reg(codec, ES8389_CSM_STATE_REG0xF1, 0x00);
@@ -555,6 +615,7 @@ static int es8389_open(const audio_codec_if_t *h, void *cfg, int cfg_size)
     // Set ADC and DAC data format
     if (codec_cfg->no_dac_ref == false) {
         /* set internal reference signal (ADCL + DACR) */
+        es8389_update_bits(codec, ES8389_ADC_SP_CONTROL_REG0x23, 0x80, 0x80);
         ret |= es8389_write_reg(codec, ES8389_CHIP_MISC_CONTROL_REG0xF0, (int)(0x12 + (1 << 3) + (0 << 2)));
         ESP_LOGI(TAG, "Set internal reference signal");
     } else {
@@ -571,20 +632,33 @@ static int es8389_open(const audio_codec_if_t *h, void *cfg, int cfg_size)
     if (ret != 0) {
         return ESP_CODEC_DEV_WRITE_FAIL;
     }
-    es8389_pa_power(codec, ES_PA_SETUP | ES_PA_ENABLE);
+    codec->no_dac_ref = codec_cfg->no_dac_ref;
     codec->is_open = true;
     return ESP_CODEC_DEV_OK;
 }
 
 static int es8389_close(const audio_codec_if_t *h)
 {
-    audio_codec_es8389_t *codec = (audio_codec_es8389_t *) h;
+    audio_codec_es8389_t *codec = (audio_codec_es8389_t *)h;
     if (codec == NULL) {
         return ESP_CODEC_DEV_INVALID_ARG;
     }
     if (codec->is_open) {
-        es8389_pa_power(codec, ES_PA_DISABLE);
-        es8389_suspend(codec);
+        audio_codec_ctrl_info_t ctrl_info = {0};
+        codec->cfg.ctrl_if->get_info(codec->cfg.ctrl_if, &ctrl_info);
+        int open_cnt = codec_ref_release(&ctrl_info, CODEC_REF_STAGE_OPEN);
+        if (open_cnt < 0) {
+            ESP_LOGE(TAG, "Failed to release codec device open reference");
+            return ESP_CODEC_DEV_WRITE_FAIL;
+        }
+        if (open_cnt == 0) {
+            es8389_set_mute(h, true);
+            es8389_pa_power(codec, ES_PA_DISABLE);
+            es8389_suspend(codec);
+            ESP_LOGI(TAG, "Codec hardware closed");
+        } else {
+            ESP_LOGI(TAG, "Codec still in use (open_count=%d), skip hardware close", open_cnt);
+        }
         codec->is_open = false;
     }
     return ESP_CODEC_DEV_OK;
@@ -603,15 +677,13 @@ static int es8389_set_fs(const audio_codec_if_t *h, esp_codec_dev_sample_info_t 
 
     es8389_set_bits_per_sample(codec, fs->bits_per_sample);
     es8389_config_fmt(codec, ES_I2S_NORMAL);
-    es8389_set_bias_standby(codec);
-    es8389_set_bias_on(codec);
     return ESP_CODEC_DEV_OK;
 }
 
 static int es8389_enable(const audio_codec_if_t *h, bool enable)
 {
     int ret = ESP_CODEC_DEV_OK;
-    audio_codec_es8389_t *codec = (audio_codec_es8389_t *) h;
+    audio_codec_es8389_t *codec = (audio_codec_es8389_t *)h;
     if (codec == NULL) {
         return ESP_CODEC_DEV_INVALID_ARG;
     }
@@ -621,12 +693,34 @@ static int es8389_enable(const audio_codec_if_t *h, bool enable)
     if (enable == codec->enabled) {
         return ESP_CODEC_DEV_OK;
     }
+    int codec_mode = codec->cfg.codec_mode;
+    audio_codec_ctrl_info_t ctrl_info = {0};
+    codec->cfg.ctrl_if->get_info(codec->cfg.ctrl_if, &ctrl_info);
     if (enable) {
+        if (codec_ref_acquire(&ctrl_info, CODEC_REF_STAGE_ENABLE) < 0) {
+            ESP_LOGE(TAG, "Failed to acquire codec device enable reference");
+            return ESP_CODEC_DEV_WRITE_FAIL;
+        }
         ret = es8389_start(codec);
         es8389_pa_power(codec, ES_PA_ENABLE);
+        if (codec_mode == ESP_CODEC_DEV_WORK_MODE_ADC || codec_mode == ESP_CODEC_DEV_WORK_MODE_BOTH) {
+            es8389_set_mute(h, false);
+        }
     } else {
+        if (codec_mode == ESP_CODEC_DEV_WORK_MODE_ADC || codec_mode == ESP_CODEC_DEV_WORK_MODE_BOTH) {
+            es8389_set_mute(h, true);
+        }
         es8389_pa_power(codec, ES_PA_DISABLE);
-        ret = es8389_suspend(codec);
+        int en_cnt = codec_ref_release(&ctrl_info, CODEC_REF_STAGE_ENABLE);
+        if (en_cnt < 0) {
+            ESP_LOGE(TAG, "Failed to release codec device enable reference");
+            return ESP_CODEC_DEV_WRITE_FAIL;
+        }
+        if (en_cnt == 0) {
+            ret = es8389_stop(codec);
+        } else {
+            ESP_LOGI(TAG, "Codec still enabled (enable_count=%d), skip hardware stop", en_cnt);
+        }
     }
     if (ret == ESP_CODEC_DEV_OK) {
         codec->enabled = enable;
@@ -685,7 +779,17 @@ const audio_codec_if_t *es8389_codec_new(es8389_codec_cfg_t *codec_cfg)
         ESP_LOGE(TAG, "Control interface not open yet");
         return NULL;
     }
-    audio_codec_es8389_t *codec = (audio_codec_es8389_t *) calloc(1, sizeof(audio_codec_es8389_t));
+    if (codec_cfg->ctrl_if->get_info == NULL) {
+        ESP_LOGE(TAG, "Control interface missing get_info");
+        return NULL;
+    }
+    audio_codec_ctrl_info_t ctrl_info = {0};
+    if (codec_cfg->ctrl_if->get_info(codec_cfg->ctrl_if, &ctrl_info) != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "Failed to get control interface info");
+        return NULL;
+    }
+
+    audio_codec_es8389_t *codec = (audio_codec_es8389_t *)calloc(1, sizeof(audio_codec_es8389_t));
     if (codec == NULL) {
         CODEC_MEM_CHECK(codec);
         return NULL;
@@ -695,6 +799,7 @@ const audio_codec_if_t *es8389_codec_new(es8389_codec_cfg_t *codec_cfg)
     codec->base.set_fs = es8389_set_fs;
     codec->base.set_vol = es8389_set_vol;
     codec->base.set_mic_gain = es8389_set_mic_gain;
+    codec->base.set_mic_channel_gain = es8389_set_mic_channel_gain;
     codec->base.mute = es8389_set_mute;
     codec->base.set_reg = es8389_set_reg;
     codec->base.get_reg = es8389_get_reg;
@@ -702,10 +807,23 @@ const audio_codec_if_t *es8389_codec_new(es8389_codec_cfg_t *codec_cfg)
     codec->base.close = es8389_close;
     codec->hw_gain = esp_codec_dev_col_calc_hw_gain(&codec_cfg->hw_gain);
     do {
-        int ret = codec->base.open(&codec->base, codec_cfg, sizeof(es8389_codec_cfg_t));
-        if (ret != 0) {
-            ESP_LOGE(TAG, "Open fail");
+        int open_cnt = codec_ref_acquire(&ctrl_info, CODEC_REF_STAGE_OPEN);
+        if (open_cnt < 0) {
+            ESP_LOGE(TAG, "Failed to acquire codec device open reference");
             break;
+        }
+        es8389_apply_cfg(codec, codec_cfg);
+        es8389_pa_power(codec, ES_PA_SETUP | ES_PA_DISABLE);
+        if (open_cnt == 1) {
+            int ret = codec->base.open(&codec->base, codec_cfg, sizeof(es8389_codec_cfg_t));
+            if (ret != 0) {
+                ESP_LOGE(TAG, "Open fail");
+                codec_ref_release(&ctrl_info, CODEC_REF_STAGE_OPEN);
+                break;
+            }
+        } else {
+            codec->is_open = true;
+            ESP_LOGI(TAG, "Codec already opened, reusing (open_count=%d)", open_cnt);
         }
         return &codec->base;
     } while (0);

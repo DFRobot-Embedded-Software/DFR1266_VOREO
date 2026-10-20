@@ -5,7 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] 
+## [1.8.2] 2026-05-11
+### Fixed
+- Row dot product calculation for int8
+
+## [1.8.1] 2026-04-19
+### Added
+- Row dot product calculation for int8
+- Matrix with int8 vector multiplication
+
+
+## [1.8.0] 2026-04-07
+### Added
+- Support for esp32s31
+
+## [1.7.1] 2026-03-06
+### Added
+- Spell check
+
+### Fixed
+- Fix for build EKF with IDF 6.0
+- Update ranges in tests to pass for target linux
+- Bugfix fird f32 for esp32s3
+
+## [1.7.0] 2025-06-15
+### Added
+- Multirate FIR filter
+- Resampler based on Multirate FIR  
+
+## [1.6.3] 2025-05-19
+### Fixed
+- FFT2R test case typo
+- IIR filter remove legacy a++
+
+
+## [1.6.2] 2025-04-28
+### Fixed
+- FFT2R output buffer overrun is fixed
+
+## [1.6.1] 2025-04-17
+### Changed
+- The fft4r added function with the same name as for esp32 to be compatible with precompiled libraries
 
 ## [1.6.0] 2025-04-16
 ### Added
@@ -116,7 +156,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Fix in tests to pass
-- Minimum coeffcient length for fird_s16
+- Minimum coefficient length for fird_s16
 - Include malloc.h into dsps_fft4r_fc32_ansi.c
 - Fix for calculation length for dsps_corr_f32_axxx
 

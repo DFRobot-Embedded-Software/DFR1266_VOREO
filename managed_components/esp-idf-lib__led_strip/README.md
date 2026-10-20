@@ -1,3 +1,7 @@
+# Warning!
+
+**This component is obsolete and unsupported! Please use [espressif/led_strip](https://components.espressif.com/components/espressif/led_strip) instead.**
+
 # esp-idf-lib/led_strip
 
 [![Build examples](https://github.com/esp-idf-lib/led_strip/actions/workflows//build.yml/badge.svg)](https://github.com/esp-idf-lib/led_strip/actions/workflows//build.yml)

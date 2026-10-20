@@ -166,6 +166,8 @@ static const led_params_t led_params[] =
 
 void led_strip_install()
 {
+    ESP_LOGW(TAG, "This component is outdated and not supported! Please use espressif/led_strip instead.");
+
     float ratio = (float)APB_CLK_FREQ / LED_STRIP_RMT_CLK_DIV / 1e09f;
 
     for (size_t i = 0; i < LED_STRIP_TYPE_MAX; i++)

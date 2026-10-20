@@ -4,6 +4,8 @@
 
 本工具用于将多个独立的 bin 文件合并为一个完整的烧录文件，简化烧录过程。
 
+当前配置：**4MB Flash**，已去除 `model` / srmodels（无 ESP32 本地唤醒/AFE）。
+
 ## 文件说明
 
 - `merge_bin.py` - Python 合并脚本
@@ -28,7 +30,7 @@ flash_merged.bat COM32 460800
 
 # 或者直接使用 esptool.py 烧录
 esptool.py -p COM32 -b 460800 --before default_reset --after hard_reset --chip esp32s3 ^
-    write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0 merged_firmware.bin
+    write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 merged_firmware.bin
 ```
 
 #### Linux/Mac:
@@ -46,7 +48,7 @@ chmod +x flash_merged.sh
 
 # 或者直接使用 esptool.py 烧录
 esptool.py -p /dev/ttyUSB0 -b 460800 --before default_reset --after hard_reset --chip esp32s3 \
-    write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0 merged_firmware.bin
+    write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 merged_firmware.bin
 ```
 
 ### 方法 2: 使用 esptool.py 的 merge_bin 命令（ESP-IDF 5.1+）
@@ -55,15 +57,14 @@ esptool.py -p /dev/ttyUSB0 -b 460800 --before default_reset --after hard_reset -
 # 合并文件
 esptool.py --chip esp32s3 merge_bin \
     -o merged_firmware.bin \
-    --flash_mode dio --flash_freq 80m --flash_size 16MB \
+    --flash_mode dio --flash_freq 80m --flash_size 4MB \
     0x0 build/bootloader/bootloader.bin \
     0x8000 build/partition_table/partition-table.bin \
-    0x10000 build/DFR1266_VOREO.bin \
-    0x610000 build/srmodels/srmodels.bin
+    0x10000 build/DFR1266_VOREO.bin
 
 # 烧录
 esptool.py -p COM32 -b 460800 --before default_reset --after hard_reset --chip esp32s3 \
-    write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0 merged_firmware.bin
+    write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 merged_firmware.bin
 ```
 
 ## 文件地址映射
@@ -73,14 +74,14 @@ esptool.py -p COM32 -b 460800 --before default_reset --after hard_reset --chip e
 | bootloader.bin | 0x0 | Bootloader |
 | partition-table.bin | 0x8000 | 分区表 |
 | DFR1266_VOREO.bin | 0x10000 | 应用程序 |
-| srmodels.bin | 0x610000 | 语音模型（SPIFFS 分区） |
 
 ## 注意事项
 
 1. **编译顺序**: 必须先运行 `idf.py build` 生成所有 bin 文件
 2. **文件路径**: 确保所有 bin 文件都在 `build` 目录下
-3. **Flash 大小**: 当前配置为 16MB，如需修改请编辑 `merge_bin.py`
+3. **Flash 大小**: 当前配置为 **4MB**，如需修改请编辑 `merge_bin.py` / `partitions.csv` / `sdkconfig`
 4. **地址冲突**: 合并脚本会自动检查地址是否超出 Flash 范围
+5. **换料**: 若板子仍是 16MB 芯片，也可按 4MB 镜像烧录（只用前 4MB）；量产 4MB 料号需与分区一致
 
 ## 故障排除
 
@@ -101,18 +102,16 @@ esptool.py -p COM32 -b 460800 --before default_reset --after hard_reset --chip e
 
 ```bash
 esptool.py -p COM32 -b 460800 --before default_reset --after hard_reset --chip esp32s3 \
-    write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB \
+    write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB \
     0x0 bootloader/bootloader.bin \
-    0x10000 DFR1266_VOREO.bin \
     0x8000 partition_table/partition-table.bin \
-    0x610000 srmodels/srmodels.bin
+    0x10000 DFR1266_VOREO.bin
 ```
 
 合并后简化为：
 
 ```bash
 esptool.py -p COM32 -b 460800 --before default_reset --after hard_reset --chip esp32s3 \
-    write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB \
+    write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB \
     0x0 merged_firmware.bin
 ```
-

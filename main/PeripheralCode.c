@@ -1113,17 +1113,8 @@ static void userTask(void *pvParameters)
                 // 从链表中移除已发送的节点（gatDataListRemove内部会释放节点）
                 gatDataListRemove(gatDataList, node);
             } else if (node && node->cmd == USER_UART_CMD_SET_ASR) {
-                ESP_LOGI(TAG, "Set ASR data, length: %d", node->received_len);
-                // 确保字符串以 \0 结尾
-                char *wake_word = (char*)malloc(node->received_len + 1);
-                if (wake_word) {
-                    memcpy(wake_word, node->data, node->received_len);
-                    wake_word[node->received_len] = '\0';  // 添加字符串结束符
-                    setWakeWord(wake_word);
-                    free(wake_word);
-                } else {
-                    ESP_LOGE(TAG, "Failed to allocate memory for wake word");
-                }
+                // ESP32 本地 ASR/AFE 已移除；唤醒词由 GAT 模组侧配置
+                ESP_LOGW(TAG, "SET_ASR ignored (no local ESP32 ASR), len=%d", node->received_len);
                 gatDataListRemove(gatDataList, node);
             }
         }

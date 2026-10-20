@@ -1,6 +1,6 @@
 /*
  * SPDX-FileCopyrightText: 2018-2025 Espressif Systems (Shanghai) CO LTD
- * SPDX-FileContributor: 2024 f4lcOn @ Libera Chat IRC
+ * SPDX-FileContributor: 2024 f4lc0n @ Libera Chat IRC
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -13,7 +13,9 @@
 
 	.section .text 
 	.global dsps_fft4r_fc32_aes3_
+	.global dsps_fft4r_fc32_ae32_
 	.type   dsps_fft4r_fc32_aes3_,@function
+	.type   dsps_fft4r_fc32_ae32_,@function
 
 // The function implements the following C code:
 // esp_err_t dsps_fft4r_fc32_ansi_(float *data, int length, float *table, int table_size)
@@ -98,6 +100,7 @@
 	retw.n
 
 	.align  4
+dsps_fft4r_fc32_ae32_:		// this is added to make compatibility with libraries that already compiled and use ae32_ function.
 dsps_fft4r_fc32_aes3_:
 
 	entry   a1, 16        # no auto vars on stack
