@@ -36,21 +36,17 @@ static uint8_t asrState = 0;
 static i2c_slave_dev_handle_t slave_handle = NULL;
 
 static QueueHandle_t slaveReceiveQueue = NULL;
-static uint8_t i2cSlaveSendData[UART_READ_BUF_SIZE];
-static uint16_t i2cSlaveSendDataLne = 0;
-static uint8_t i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
-/* 主机库单次 requestFrom 最大 32；与 DFRobot_Voreo I2C 一致 */
-#define I2C_TX_CHUNK_MAX                32
-/* 单次 I2C 写事务最大载荷（库分包 28，留余量） */
-#define I2C_RX_EVENT_MAX                64
-static uint16_t i2cTxDataOffset = 0;             // DATA 阶段已发送偏移
-static bool i2cGotGetLen = false;                // 已收到 0x21，下一笔 TX 发长度
-static bool i2cReturnInvalidLen = false;         // 无应答时下一笔 TX 回 0xFFFF
+static uint8_t i2cSlaveSendData[I2C_APP_FRAME_MAX];
+static uint16_t i2cSlaveSendDataLen = 0;
+static uint16_t i2cTxDataOffset = 0;
+static uint8_t i2cLinkStatus = VOREO_I2C_LINK_IDLE;
+static bool i2cPendingStatusTx = false;
+static bool i2cDataPhase = false;
+static volatile bool i2cRxQueueOverflow = false;
 
-// I2C分包接收缓冲区
-static uint8_t i2cRxBuffer[UART_READ_BUF_SIZE];  // 接收缓冲区
-static uint16_t i2cRxBufferLen = 0;              // 当前接收缓冲区中的数据长度
-static uint16_t i2cExpectedPacketLen = 0;         // 期望的数据包总长度（根据包头和长度字段计算）
+static uint8_t i2cRxBuffer[I2C_APP_FRAME_MAX];
+static uint16_t i2cRxBufferLen = 0;
+static uint16_t i2cExpectedPacketLen = 0;
 
 static bool isOpen = true;  //调试
 
@@ -59,12 +55,16 @@ typedef enum {
     I2C_SLAVE_EVT_TX
 } i2c_slave_evt_type_t;
 
-/* 事件带拷贝，避免 ISR 与任务共用全局 RX 缓冲被覆盖 */
 typedef struct {
     i2c_slave_evt_type_t type;
     uint16_t len;
     uint8_t data[I2C_RX_EVENT_MAX];
 } i2c_slave_event_t;
+
+static void i2cResetRxAssemble(void);
+static void i2cResetTx(void);
+static void i2cAbortAll(void);
+static uint8_t i2cStatusForPoll(uint16_t *outLen);
 
 // GAT解析状态机状态（需要保持跨函数调用）
 static struct {
@@ -159,14 +159,22 @@ static void sendBuf(uint8_t *data, size_t len, uint8_t cmd)
         // 刷新发送缓冲区，确保数据发送完成
         uart_wait_tx_done(USERUART_PORT, pdMS_TO_TICKS(100));
     }else if(commMode == I2C_MODE){
-        ESP_LOGI(TAG, "I2C写入数据，长度: %d", total_len);
-        i2cSlaveSendDataLne = total_len;
+        if (total_len > I2C_APP_FRAME_MAX) {
+            ESP_LOGE(TAG, "I2C reply too long: %u > %u", (unsigned)total_len, I2C_APP_FRAME_MAX);
+            i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+            i2cSlaveSendDataLen = 0;
+            i2cTxDataOffset = 0;
+            i2cDataPhase = false;
+            i2cPendingStatusTx = false;
+            return;
+        }
+        ESP_LOGI(TAG, "I2C reply ready, len=%u", (unsigned)total_len);
         memcpy(i2cSlaveSendData, send_buffer, total_len);
+        i2cSlaveSendDataLen = (uint16_t)total_len;
         i2cTxDataOffset = 0;
-        i2cGotGetLen = false;
-        i2cReturnInvalidLen = false;
-        /* 等 GET_LEN 后，按 on_request 分次：先 2 字节长度，再 payload */
-        i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_LEN;
+        i2cDataPhase = false;
+        i2cPendingStatusTx = false;
+        i2cLinkStatus = VOREO_I2C_LINK_READY;
     }
 }
 
@@ -289,7 +297,14 @@ static void userParseData(const uint8_t *data, size_t len)
                     break;
                 case USER_UART_CMD_SEND_TEXT:
                     ESP_LOGI(TAG, "USER send text command received, expected data length: %d", userParseState.dataLen);
-                    // 如果有数据需要接收，创建节点并进入数据接收状态
+                    /* TTS 单包最大 128B，收齐后再转 GTA */
+                    if (userParseState.dataLen > VOREO_TTS_PAYLOAD_MAX) {
+                        ESP_LOGW(TAG, "USER TTS payload %u > %u, reject",
+                                 (unsigned)userParseState.dataLen, VOREO_TTS_PAYLOAD_MAX);
+                        userParseState.cmdState = USER_UART_CMD_HEAD;
+                        userParseState.dataLen = 0;
+                        break;
+                    }
                     if (userParseState.dataLen > 0) {
                         if (gatDataList) {
                             gat_data_node_t *node = gatDataNodeCreate(USER_UART_CMD_SEND_TEXT, userParseState.dataLen);
@@ -443,23 +458,64 @@ static void userParseData(const uint8_t *data, size_t len)
     }
 }
 
+static void i2cResetRxAssemble(void)
+{
+    i2cRxBufferLen = 0;
+    i2cExpectedPacketLen = 0;
+}
+
+static void i2cResetTx(void)
+{
+    i2cSlaveSendDataLen = 0;
+    i2cTxDataOffset = 0;
+    i2cPendingStatusTx = false;
+    i2cDataPhase = false;
+    i2cLinkStatus = VOREO_I2C_LINK_IDLE;
+}
+
+static void i2cAbortAll(void)
+{
+    i2cResetRxAssemble();
+    i2cResetTx();
+    ESP_LOGI(TAG, "I2C ABORT: rx/tx cleared");
+}
+
+static uint8_t i2cStatusForPoll(uint16_t *outLen)
+{
+    *outLen = 0;
+    if (i2cExpectedPacketLen > 0 && i2cRxBufferLen < i2cExpectedPacketLen) {
+        return VOREO_I2C_LINK_BUSY;
+    }
+    if (i2cLinkStatus == VOREO_I2C_LINK_READY && i2cSlaveSendDataLen > 0) {
+        *outLen = i2cSlaveSendDataLen;
+        return VOREO_I2C_LINK_READY;
+    }
+    if (i2cLinkStatus == VOREO_I2C_LINK_ERROR) {
+        return VOREO_I2C_LINK_ERROR;
+    }
+    if (i2cLinkStatus == VOREO_I2C_LINK_BUSY) {
+        return VOREO_I2C_LINK_BUSY;
+    }
+    return VOREO_I2C_LINK_IDLE;
+}
+
 /**
- * @brief I2C从机任务（处理I2C接收和发送事件）
- * @param pvParameters 任务参数（未使用）
- */
-/**
- * @brief 完整用户帧：CRC 校验后同步解析（须在 GET_LEN 前完成 sendBuf）
+ * @brief Full user frame: CRC then parse (sendBuf before STATUS READY)
  */
 static void i2cProcessUserFrame(const uint8_t *frame, uint16_t frameLen)
 {
     if (frameLen < 3) {
         ESP_LOGW(TAG, "I2C frame too short: %u", frameLen);
+        i2cLinkStatus = VOREO_I2C_LINK_ERROR;
         return;
     }
     uint16_t calculated_crc = calculateCRC16(frame, frameLen - 2);
     uint16_t received_crc = ((uint16_t)frame[frameLen - 2] << 8) | frame[frameLen - 1];
     if (calculated_crc != received_crc) {
         ESP_LOGW(TAG, "I2C CRC error calc=0x%04X recv=0x%04X", calculated_crc, received_crc);
+        i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+        i2cSlaveSendDataLen = 0;
+        i2cDataPhase = false;
         return;
     }
     userParseData(frame, frameLen - 2);
@@ -469,148 +525,171 @@ static void i2cSlaveTask(void *pvParameters)
 {
     i2c_slave_event_t event;
     uint32_t write_len = 0;
-    
+    TickType_t assembleStartTick = 0;
+
     while (1)
     {
-        if(xQueueReceive(slaveReceiveQueue, &event, portMAX_DELAY) == pdTRUE){
-            if(event.type == I2C_SLAVE_EVT_TX){
-                /*
-                 * 分次填 TX（每笔 Master Read 一次 on_request）：
-                 *  1) LEN：只写 2 字节大端长度
-                 *  2) DATA：每次最多 I2C_TX_CHUNK_MAX 字节 payload
-                 */
-                if (i2cReturnInvalidLen) {
-                    uint8_t errorData[2] = {0xff, 0xff};
-                    i2c_slave_write(slave_handle, errorData, 2, &write_len, pdMS_TO_TICKS(50));
-                    i2cReturnInvalidLen = false;
-                    ESP_LOGW(TAG, "I2C TX: invalid len 0xFFFF");
+        if (i2cRxQueueOverflow) {
+            i2cRxQueueOverflow = false;
+            ESP_LOGE(TAG, "I2C RX queue overflow -> ERROR");
+            i2cAbortAll();
+            i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+        }
+
+        /* 超时按「距上一包 RX」计时，兼容主机慢分包；总空闲超过 3s 才丢弃 */
+        if (i2cExpectedPacketLen > 0 && i2cRxBufferLen > 0 && i2cRxBufferLen < i2cExpectedPacketLen) {
+            if (assembleStartTick == 0) {
+                assembleStartTick = xTaskGetTickCount();
+            } else if ((xTaskGetTickCount() - assembleStartTick) > pdMS_TO_TICKS(3000)) {
+                ESP_LOGW(TAG, "I2C assemble timeout %u/%u", i2cRxBufferLen, i2cExpectedPacketLen);
+                i2cResetRxAssemble();
+                assembleStartTick = 0;
+                i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+            }
+        } else if (i2cExpectedPacketLen == 0 || i2cRxBufferLen == 0) {
+            assembleStartTick = 0;
+        }
+
+        if (xQueueReceive(slaveReceiveQueue, &event, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+
+        if (event.type == I2C_SLAVE_EVT_TX) {
+            if (i2cPendingStatusTx) {
+                uint16_t respLen = 0;
+                uint8_t st = i2cStatusForPoll(&respLen);
+                uint8_t statusBuf[3] = {
+                    st,
+                    (uint8_t)(respLen >> 8),
+                    (uint8_t)(respLen & 0xff)
+                };
+                esp_err_t err = i2c_slave_write(slave_handle, statusBuf, 3, &write_len, pdMS_TO_TICKS(20));
+                i2cPendingStatusTx = false;
+                if (err != ESP_OK || write_len != 3) {
+                    ESP_LOGW(TAG, "I2C TX status failed err=%s wrote=%lu",
+                             esp_err_to_name(err), (unsigned long)write_len);
+                    i2cLinkStatus = VOREO_I2C_LINK_ERROR;
                     continue;
                 }
-
-                if (i2cSlaveSendStatic == I2C_SLAVE_SEND_STATIC_LEN && i2cGotGetLen) {
-                    uint8_t getLenData[2] = {
-                        (uint8_t)(i2cSlaveSendDataLne >> 8),
-                        (uint8_t)(i2cSlaveSendDataLne & 0xff)
-                    };
-                    esp_err_t err = i2c_slave_write(slave_handle, getLenData, 2, &write_len, pdMS_TO_TICKS(50));
-                    if (err != ESP_OK || write_len != 2) {
-                        ESP_LOGW(TAG, "I2C TX len failed err=%s wrote=%lu",
-                                 esp_err_to_name(err), (unsigned long)write_len);
-                        i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
-                        i2cGotGetLen = false;
-                        continue;
-                    }
-                    i2cGotGetLen = false;
+                ESP_LOGI(TAG, "I2C TX status=%u len=%u", st, respLen);
+                if (st == VOREO_I2C_LINK_READY && respLen > 0) {
+                    i2cDataPhase = true;
                     i2cTxDataOffset = 0;
-                    i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_DATA;
-                    ESP_LOGI(TAG, "I2C TX len=%u", i2cSlaveSendDataLne);
+                } else if (st == VOREO_I2C_LINK_ERROR) {
+                    i2cLinkStatus = VOREO_I2C_LINK_IDLE;
+                    i2cDataPhase = false;
+                    i2cSlaveSendDataLen = 0;
+                }
+                continue;
+            }
+
+            if (i2cDataPhase && i2cSlaveSendDataLen > 0) {
+                if (i2cTxDataOffset >= i2cSlaveSendDataLen) {
+                    i2cResetTx();
                     continue;
                 }
-
-                if (i2cSlaveSendStatic == I2C_SLAVE_SEND_STATIC_DATA) {
-                    if (i2cTxDataOffset >= i2cSlaveSendDataLne) {
-                        i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
-                        i2cTxDataOffset = 0;
-                        /* 勿再写 FIFO，避免污染后续 Master Write（sendText 分包） */
-                        continue;
-                    }
-                    uint16_t remaining = i2cSlaveSendDataLne - i2cTxDataOffset;
-                    uint16_t chunk = (remaining > I2C_TX_CHUNK_MAX) ? I2C_TX_CHUNK_MAX : remaining;
-                    esp_err_t err = i2c_slave_write(slave_handle, i2cSlaveSendData + i2cTxDataOffset,
-                                                    chunk, &write_len, pdMS_TO_TICKS(50));
-                    if (err != ESP_OK || write_len == 0) {
-                        ESP_LOGW(TAG, "I2C TX data failed err=%s", esp_err_to_name(err));
-                        i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
-                        i2cTxDataOffset = 0;
-                        continue;
-                    }
-                    i2cTxDataOffset += (uint16_t)write_len;
-                    ESP_LOGI(TAG, "I2C TX data %lu/%u (off=%u)",
-                             (unsigned long)write_len, i2cSlaveSendDataLne, i2cTxDataOffset);
-                    if (i2cTxDataOffset >= i2cSlaveSendDataLne) {
-                        i2cSlaveSendStatic = I2C_SLAVE_SEND_STATIC_ERROR;
-                        i2cTxDataOffset = 0;
-                    }
+                uint16_t remaining = i2cSlaveSendDataLen - i2cTxDataOffset;
+                uint16_t chunk = (remaining > I2C_TX_CHUNK_MAX) ? I2C_TX_CHUNK_MAX : remaining;
+                esp_err_t err = i2c_slave_write(slave_handle, i2cSlaveSendData + i2cTxDataOffset,
+                                                chunk, &write_len, pdMS_TO_TICKS(20));
+                if (err != ESP_OK || write_len == 0) {
+                    ESP_LOGW(TAG, "I2C TX data failed err=%s", esp_err_to_name(err));
+                    i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+                    i2cDataPhase = false;
                     continue;
                 }
-
-                /*
-                 * 无有效应答时：默认不写 TX。
-                 * 乱写 0xFFFF 会留在 FIFO 里，导致后续 sendText 分包 Master Write 卡住。
-                 * 仅 i2cReturnInvalidLen（上面已处理）在 GET_LEN 后回无效长度。
-                 */
-                if (i2cRxBufferLen > 0 || i2cExpectedPacketLen > 0) {
-                    ESP_LOGD(TAG, "I2C TX ignored (assembling rx %u/%u)",
-                             i2cRxBufferLen, i2cExpectedPacketLen);
-                } else {
-                    ESP_LOGD(TAG, "I2C TX ignored (idle)");
+                i2cTxDataOffset += (uint16_t)write_len;
+                ESP_LOGI(TAG, "I2C TX data %lu/%u (off=%u)",
+                         (unsigned long)write_len, i2cSlaveSendDataLen, i2cTxDataOffset);
+                if (i2cTxDataOffset >= i2cSlaveSendDataLen) {
+                    i2cResetTx();
                 }
-            }else if(event.type == I2C_SLAVE_EVT_RX){
-                const uint8_t *rx = event.data;
-                uint16_t rxLen = event.len;
-                ESP_LOGI(TAG, "I2C从机接收数据成功，长度: %u", rxLen);
-                if (rxLen == 0) {
+                continue;
+            }
+            continue;
+        }
+
+        if (event.type != I2C_SLAVE_EVT_RX) {
+            continue;
+        }
+
+        const uint8_t *rx = event.data;
+        uint16_t rxLen = event.len;
+        ESP_LOGI(TAG, "I2C RX len=%u", rxLen);
+        if (rxLen == 0) {
+            continue;
+        }
+
+        if (rxLen == 1 && rx[0] == I2C_SLAVE_CMD_ABORT) {
+            i2cAbortAll();
+            continue;
+        }
+
+        if (rxLen == 1 && rx[0] == I2C_SLAVE_CMD_GET_LEN) {
+            ESP_LOGI(TAG, "I2C CMD_STATUS");
+            i2cPendingStatusTx = true;
+            continue;
+        }
+
+        if (i2cDataPhase || i2cPendingStatusTx) {
+            ESP_LOGW(TAG, "I2C new frame during TX phase, reset TX");
+            i2cResetTx();
+        }
+
+        if (i2cRxBufferLen + rxLen > I2C_APP_FRAME_MAX) {
+            ESP_LOGW(TAG, "I2C RX overflow, reset");
+            i2cResetRxAssemble();
+            i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+            continue;
+        }
+        memcpy(i2cRxBuffer + i2cRxBufferLen, rx, rxLen);
+        i2cRxBufferLen += rxLen;
+        assembleStartTick = xTaskGetTickCount(); /* 每收到一块刷新，避免慢分包误超时 */
+
+        if (i2cExpectedPacketLen == 0 && i2cRxBufferLen >= 3) {
+            if (i2cRxBuffer[0] == USER_UART_CMD_HEAD) {
+                uint16_t dataLen = ((uint16_t)i2cRxBuffer[1] << 8) | i2cRxBuffer[2];
+                uint16_t expect = (uint16_t)(6 + dataLen);
+                if (expect > I2C_APP_FRAME_MAX) {
+                    ESP_LOGW(TAG, "I2C frame too large: %u", expect);
+                    i2cResetRxAssemble();
+                    i2cLinkStatus = VOREO_I2C_LINK_ERROR;
                     continue;
                 }
+                i2cExpectedPacketLen = expect;
+                assembleStartTick = xTaskGetTickCount();
+                ESP_LOGI(TAG, "I2C assemble expect=%u cur=%u", i2cExpectedPacketLen, i2cRxBufferLen);
+            } else {
+                ESP_LOGW(TAG, "I2C bad head 0x%02X", i2cRxBuffer[0]);
+                i2cResetRxAssemble();
+                assembleStartTick = 0;
+                i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+            }
+        }
 
-                /* GET_LEN：丢弃未完成组包，避免 0x21 被吃进脏缓冲；并须已同步 sendBuf */
-                if (rxLen == 1 && rx[0] == I2C_SLAVE_CMD_GET_LEN) {
-                    if (i2cRxBufferLen > 0) {
-                        ESP_LOGW(TAG, "GET_LEN: drop stale rx buf %u", i2cRxBufferLen);
-                        i2cRxBufferLen = 0;
-                        i2cExpectedPacketLen = 0;
-                    }
-                    ESP_LOGI(TAG, "收到I2C GET_LEN命令");
-                    if (i2cSlaveSendStatic == I2C_SLAVE_SEND_STATIC_LEN && i2cSlaveSendDataLne > 0) {
-                        i2cGotGetLen = true;
-                        i2cReturnInvalidLen = false;
-                    } else {
-                        i2cGotGetLen = false;
-                        i2cReturnInvalidLen = true;
-                        ESP_LOGW(TAG, "GET_LEN but response not ready");
-                    }
-                    continue;
+        while (i2cExpectedPacketLen > 0 && i2cRxBufferLen >= i2cExpectedPacketLen) {
+            ESP_LOGI(TAG, "I2C frame complete len=%u", i2cExpectedPacketLen);
+            i2cProcessUserFrame(i2cRxBuffer, i2cExpectedPacketLen);
+
+            uint16_t remain = i2cRxBufferLen - i2cExpectedPacketLen;
+            if (remain > 0) {
+                memmove(i2cRxBuffer, i2cRxBuffer + i2cExpectedPacketLen, remain);
+            }
+            i2cRxBufferLen = remain;
+            i2cExpectedPacketLen = 0;
+            assembleStartTick = 0;
+            if (i2cRxBufferLen >= 3 && i2cRxBuffer[0] == USER_UART_CMD_HEAD) {
+                uint16_t dataLen = ((uint16_t)i2cRxBuffer[1] << 8) | i2cRxBuffer[2];
+                uint16_t expect = (uint16_t)(6 + dataLen);
+                if (expect > I2C_APP_FRAME_MAX) {
+                    i2cResetRxAssemble();
+                    i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+                    break;
                 }
-
-                /* 分包组帧；收齐后同步 CRC+解析，保证下一事件 GET_LEN 时应答已就绪 */
-                if (i2cRxBufferLen + rxLen > UART_READ_BUF_SIZE) {
-                    ESP_LOGW(TAG, "I2C接收缓冲区溢出，重置");
-                    i2cRxBufferLen = 0;
-                    i2cExpectedPacketLen = 0;
-                }
-                memcpy(i2cRxBuffer + i2cRxBufferLen, rx, rxLen);
-                i2cRxBufferLen += rxLen;
-
-                if (i2cExpectedPacketLen == 0 && i2cRxBufferLen >= 3) {
-                    if (i2cRxBuffer[0] == USER_UART_CMD_HEAD) {
-                        uint16_t dataLen = ((uint16_t)i2cRxBuffer[1] << 8) | i2cRxBuffer[2];
-                        i2cExpectedPacketLen = 6 + dataLen;
-                        ESP_LOGI(TAG, "I2C开始接收数据包，数据长度: %u，期望总长度: %u，当前: %u",
-                                 dataLen, i2cExpectedPacketLen, i2cRxBufferLen);
-                    } else {
-                        ESP_LOGW(TAG, "I2C包头错误: 0x%02X，重置", i2cRxBuffer[0]);
-                        i2cRxBufferLen = 0;
-                        i2cExpectedPacketLen = 0;
-                    }
-                }
-
-                while (i2cExpectedPacketLen > 0 && i2cRxBufferLen >= i2cExpectedPacketLen) {
-                    ESP_LOGI(TAG, "I2C数据包接收完成，长度: %u", i2cExpectedPacketLen);
-                    i2cProcessUserFrame(i2cRxBuffer, i2cExpectedPacketLen);
-
-                    uint16_t remain = i2cRxBufferLen - i2cExpectedPacketLen;
-                    if (remain > 0) {
-                        memmove(i2cRxBuffer, i2cRxBuffer + i2cExpectedPacketLen, remain);
-                    }
-                    i2cRxBufferLen = remain;
-                    i2cExpectedPacketLen = 0;
-                    if (i2cRxBufferLen >= 3 && i2cRxBuffer[0] == USER_UART_CMD_HEAD) {
-                        uint16_t dataLen = ((uint16_t)i2cRxBuffer[1] << 8) | i2cRxBuffer[2];
-                        i2cExpectedPacketLen = 6 + dataLen;
-                    } else if (i2cRxBufferLen > 0 && i2cRxBuffer[0] != USER_UART_CMD_HEAD) {
-                        i2cRxBufferLen = 0;
-                    }
-                }
+                i2cExpectedPacketLen = expect;
+                assembleStartTick = xTaskGetTickCount();
+            } else if (i2cRxBufferLen > 0 && i2cRxBuffer[0] != USER_UART_CMD_HEAD) {
+                i2cRxBufferLen = 0;
             }
         }
     }
@@ -759,15 +838,21 @@ static void gtaParseData(const uint8_t *data, size_t len)
         }else if(gatParseState.cmdState == UART_CMD_LEN_L){
             gatParseState.dataLen |= (uint16_t)data[i];
             gatParseState.cmdState = GAT_UART_CMD_DATA;
-            // Create a new node for ASR data and add to list
-            if (gatDataList && gatParseState.dataLen > 0) {
+            /* FD 00 A2 + len + UTF-8 + FF：每帧从头存储，上限 4KB */
+            if (gatParseState.dataLen > VOREO_ASR_PAYLOAD_MAX) {
+                ESP_LOGW(TAG, "ASR len %u > %u, drop frame",
+                         (unsigned)gatParseState.dataLen, VOREO_ASR_PAYLOAD_MAX);
+                gatParseState.cmdState = GAT_UART_CMD_HEAD0;
+                gatParseState.dataLen = 0;
+            } else if (gatDataList && gatParseState.dataLen > 0) {
+                gatDataListRemoveAllCmd(gatDataList, GAT_CMD_ASR_DATA);
                 gat_data_node_t *node = gatDataNodeCreate(GAT_CMD_ASR_DATA, gatParseState.dataLen);
                 if (node) {
                     gatDataListAdd(gatDataList, node);
-                    ESP_LOGI(TAG, "Created GAT data node, expected length: %d", gatParseState.dataLen);
+                    ESP_LOGI(TAG, "ASR frame restart, expected length: %d", gatParseState.dataLen);
                 } else {
                     ESP_LOGE(TAG, "Failed to create GAT data node, reset state");
-                    gatParseState.cmdState = GAT_UART_CMD_HEAD0; // Reset on error
+                    gatParseState.cmdState = GAT_UART_CMD_HEAD0;
                     gatParseState.dataLen = 0;
                 }
             } else {
@@ -976,6 +1061,22 @@ int gatDataListRemove(gat_data_list_t *list, gat_data_node_t *node)
     return 0;
 }
 
+void gatDataListRemoveAllCmd(gat_data_list_t *list, uint8_t cmd)
+{
+    if (!list) {
+        return;
+    }
+    gat_data_node_t *current = list->head;
+    while (current) {
+        gat_data_node_t *next = current->next;
+        if (current->cmd == cmd) {
+            gatDataListRemove(list, current);
+        }
+        current = next;
+    }
+}
+
+
 /**
  * @brief 获取链表中第一个未完成的节点
  * @param list 链表指针
@@ -1107,10 +1208,14 @@ static void userTask(void *pvParameters)
             }
 
             if (node && node->cmd == USER_UART_CMD_SEND_TEXT) {
-                // 用户文本作为 TTS 播报发给 GTA：DF A0 + UTF-8 + FF
-                sendBufToGAT(GAT_HOST_CMD_TTS, node->data, node->received_len);
-                ESP_LOGI(TAG, "Sent TTS to GTA, length: %d", node->received_len);
-                // 从链表中移除已发送的节点（gatDataListRemove内部会释放节点）
+                /* 收齐一包且 ≤128B 才转发 GTA */
+                if (node->received_len > VOREO_TTS_PAYLOAD_MAX) {
+                    ESP_LOGE(TAG, "TTS packet %u > %u, drop",
+                             (unsigned)node->received_len, VOREO_TTS_PAYLOAD_MAX);
+                } else {
+                    sendBufToGAT(GAT_HOST_CMD_TTS, node->data, node->received_len);
+                    ESP_LOGI(TAG, "Sent TTS to GTA, length: %d", node->received_len);
+                }
                 gatDataListRemove(gatDataList, node);
             } else if (node && node->cmd == USER_UART_CMD_SET_ASR) {
                 // ESP32 本地 ASR/AFE 已移除；唤醒词由 GAT 模组侧配置
@@ -1140,7 +1245,9 @@ static bool i2cSlaveReceiveDoneCb(i2c_slave_dev_handle_t i2c_slave, const i2c_sl
     if (copy_len > 0 && evt_data->buffer) {
         memcpy(evt.data, evt_data->buffer, copy_len);
     }
-    xQueueSendFromISR(receive_queue, &evt, &xTaskWoken);
+    if (xQueueSendFromISR(receive_queue, &evt, &xTaskWoken) != pdTRUE) {
+        i2cRxQueueOverflow = true;
+    }
     return xTaskWoken;
 }
 
@@ -1216,8 +1323,8 @@ int peripheralInit(void)
             .clk_source = I2C_CLK_SRC_DEFAULT,
             .i2c_port = I2C_SLAVE_NUM,
             /* len(2)+整帧预填，需覆盖长 ASR 文本 */
-            .send_buf_depth = UART_READ_BUF_SIZE + 2,
-            .receive_buf_depth = UART_READ_BUF_SIZE,
+            .send_buf_depth = I2C_APP_FRAME_MAX + 3,
+            .receive_buf_depth = I2C_APP_FRAME_MAX,
             .scl_io_num = USERUART_RX_SCL_GPIO,
             .sda_io_num = USERUART_TX_SDA_GPIO,
             .slave_addr = USERI2C_ADDRESS,
@@ -1231,7 +1338,7 @@ int peripheralInit(void)
             return -1;
         }
         /* 队列项含 RX 拷贝，加深以防 sendText 分包连发 */
-        slaveReceiveQueue = xQueueCreate(32, sizeof(i2c_slave_event_t));
+        slaveReceiveQueue = xQueueCreate(64, sizeof(i2c_slave_event_t));
         if (slaveReceiveQueue == NULL) {
             ESP_LOGE(TAG, "创建I2C队列失败");
             return -1;
@@ -1264,15 +1371,15 @@ int peripheralInit(void)
         ESP_LOGI(TAG, "GTA selftest: isOpen=%d after %d ms", (int)isOpen, elapsed);
 
         /* DF A1 + 0x08 + FF */
-        setGatVolume(0x0F);
+        setGatVolume(0x06);
         vTaskDelay(pdMS_TO_TICKS(200));
 
         /* DF A2 + 0x08 + FF */
-        setGatSpeed(0x01);
+        setGatSpeed(0x03);
         vTaskDelay(pdMS_TO_TICKS(200));
 
-        /* DF A0 + UTF-8「今天天气怎么样」+ FF */
-        sendTextToGAT("今天天气怎么样");
+        /* DF A0 + UTF-8「」+ FF */
+        sendTextToGAT("欢迎使用");
         ESP_LOGI(TAG, "GTA selftest done (vol/speed/TTS)");
     }
 #endif
@@ -1460,8 +1567,8 @@ void sendTextToGAT(const char *text)
         return;
     }
     size_t len = strlen(text);
-    if (len > GAT_DATA_BUFFER_MAX_SIZE) {
-        ESP_LOGE(TAG, "sendTextToGAT: text too long (%u)", (unsigned)len);
+    if (len > VOREO_TTS_PAYLOAD_MAX) {
+        ESP_LOGE(TAG, "sendTextToGAT: text too long (%u > %u)", (unsigned)len, VOREO_TTS_PAYLOAD_MAX);
         return;
     }
     /* DF A0 + UTF-8 + FF */

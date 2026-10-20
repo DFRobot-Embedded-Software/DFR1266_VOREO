@@ -75,7 +75,21 @@
 
 
 #define I2C_SLAVE_CMD_ERROR               (0x20)
-#define I2C_SLAVE_CMD_GET_LEN             (0x21)
+#define I2C_SLAVE_CMD_GET_LEN             (0x21)  /* STATUS: Write then Read 3 bytes [status][len_h][len_l] */
+#define I2C_SLAVE_CMD_ABORT               (0x2F)  /* clear assemble/TX */
+
+/* Link STATUS byte0; do NOT name I2C_STATUS_* (clashes with ESP-IDF enum) */
+#define VOREO_I2C_LINK_IDLE               (0x00)
+#define VOREO_I2C_LINK_BUSY               (0x01)
+#define VOREO_I2C_LINK_READY              (0x02)
+#define VOREO_I2C_LINK_ERROR              (0x03)
+
+#define VOREO_TTS_PAYLOAD_MAX             (128)   /* TTS 单包最大字节（UTF-8） */
+#define VOREO_ASR_PAYLOAD_MAX             (4096)  /* ASR 单帧最大字节（UTF-8） */
+
+#define I2C_APP_FRAME_MAX                 (VOREO_ASR_PAYLOAD_MAX + 6)
+#define I2C_TX_CHUNK_MAX                  (28)
+#define I2C_RX_EVENT_MAX                  (256)
 
 #define I2C_SLAVE_SEND_STATIC_OK          (0x30)
 #define I2C_SLAVE_SEND_STATIC_ERROR       (0x31)
@@ -150,6 +164,11 @@ bool gatDataNodeIsComplete(gat_data_node_t *node);
  * @return 成功返回0，失败返回-1
  */
 int gatDataListRemove(gat_data_list_t *list, gat_data_node_t *node);
+
+/**
+ * @brief 移除并释放链表中所有指定 cmd 的节点（ASR 新帧从头存储）
+ */
+void gatDataListRemoveAllCmd(gat_data_list_t *list, uint8_t cmd);
 
 /**
  * @brief 获取第一个未完成的节点（用于接收数据）
