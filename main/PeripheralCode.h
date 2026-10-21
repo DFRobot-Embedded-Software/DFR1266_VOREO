@@ -101,7 +101,7 @@
 #define VOREO_ASR_PAYLOAD_MAX             (4096)  /* ASR 单帧最大字节（UTF-8） */
 
 #define I2C_APP_FRAME_MAX                 (VOREO_ASR_PAYLOAD_MAX + 6)
-#define I2C_TX_CHUNK_MAX                  (128)  /* 邮箱 DATA 单次泵送上限 */
+#define I2C_TX_CHUNK_MAX                  (16)   /* 与 UNO Wire 单次 requestFrom 对齐，避免一次泵过多 */
 #define I2C_RX_EVENT_MAX                  (256)
 
 #define I2C_SLAVE_SEND_STATIC_OK          (0x30)

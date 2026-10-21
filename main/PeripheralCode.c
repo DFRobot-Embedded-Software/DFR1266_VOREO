@@ -13,6 +13,7 @@
 #include "esp_console.h"
 #include "linenoise/linenoise.h"
 #include "driver/i2c_slave.h"
+#include "hal/i2c_ll.h"
 #include <string.h>
 #include "esp_log.h"
 #include "UserCode.h"
@@ -20,7 +21,7 @@
 #define TAG "USER_PERIPHERAL"
 
 /* 上电后直接向 GTA 发送音量/语速/TTS 三条命令做联调；测完改 0 */
-#define GTA_HOST_CMD_SELFTEST           1
+#define GTA_HOST_CMD_SELFTEST           0
 
 // CRC16-CCITT 多项式 (0x1021)
 #define CRC16_POLYNOMIAL 0x1021
@@ -68,6 +69,8 @@ static void i2cResetRxAssemble(void);
 static void i2cResetTx(void);
 static void i2cAbortAll(void);
 static void i2cMailboxPumpTx(void);
+static void i2cSlaveClearStretchOnly(void);
+static void i2cSlaveWriteReleaseStretch(const uint8_t *data, uint32_t len);
 
 // GAT解析状态机状态（需要保持跨函数调用）
 static struct {
@@ -502,12 +505,54 @@ static uint8_t i2cMailboxStatus(uint16_t *outLen)
     return VOREO_I2C_LINK_IDLE;
 }
 
+/* S3：写事务用 LL 清 stretch；读事务用 i2c_slave_write（禁止 timeout=0） */
+#define I2C_SLAVE_WRITE_TIMEOUT_MS  (50)
+
+static inline i2c_dev_t *i2cSlaveHw(void)
+{
+    return I2C_LL_GET_HW(I2C_SLAVE_NUM);
+}
+
+static void i2cSlaveClearStretchOnly(void)
+{
+    i2c_ll_slave_clear_stretch(i2cSlaveHw());
+}
+
+static void i2cSlaveWriteReleaseStretch(const uint8_t *data, uint32_t len)
+{
+    uint32_t write_len = 0;
+    uint8_t dummy = 0xFF;
+    if (data == NULL || len == 0) {
+        data = &dummy;
+        len = 1;
+    }
+    esp_err_t err = i2c_slave_write(slave_handle, data, len, &write_len, I2C_SLAVE_WRITE_TIMEOUT_MS);
+    if (err != ESP_OK || write_len == 0) {
+        write_len = 0;
+        i2c_slave_write(slave_handle, &dummy, 1, &write_len, I2C_SLAVE_WRITE_TIMEOUT_MS);
+    }
+}
+
 /** 按当前 mbReg 从静态映像泵数据到硬件 FIFO；失败也写 dummy，避免主机 SCL 死等 */
 static void i2cMailboxPumpTx(void)
 {
     uint32_t write_len = 0;
     uint8_t reg = i2cMbReg;
     uint8_t dummy = 0xFF;
+    i2c_dev_t *hw = i2cSlaveHw();
+    i2c_slave_read_write_status_t rw = i2c_ll_slave_get_read_write_status(hw);
+
+    /*
+     * 写事务 / 总线空闲时的迟到 TX 事件：只清 stretch。
+     * 若误走 i2c_slave_write，会与 UNO 下一笔 FIFO 分包冲突 → 主机卡死、从机停在 27/N。
+     */
+    if (rw != I2C_SLAVE_READ_BY_MASTER) {
+        i2c_ll_slave_clear_stretch(hw);
+        return;
+    }
+
+    /* 主机读：先复位 HW TX FIFO，避免残留 */
+    i2c_ll_txfifo_rst(hw);
 
     if (reg == VOREO_REG_STATUS || reg == VOREO_REG_LEN_H || reg == VOREO_REG_LEN_L) {
         uint16_t respLen = 0;
@@ -517,11 +562,12 @@ static void i2cMailboxPumpTx(void)
             (uint8_t)(respLen >> 8),
             (uint8_t)(respLen & 0xff)
         };
-        esp_err_t err = i2c_slave_write(slave_handle, statusBuf, 3, &write_len, 0);
+        esp_err_t err = i2c_slave_write(slave_handle, statusBuf, 3, &write_len,
+                                        I2C_SLAVE_WRITE_TIMEOUT_MS);
         if (err != ESP_OK || write_len < 3) {
             ESP_LOGW(TAG, "I2C mailbox STATUS write fail err=%s wrote=%lu",
                      esp_err_to_name(err), (unsigned long)write_len);
-            i2c_slave_write(slave_handle, statusBuf, 3, &write_len, 50);
+            i2cSlaveWriteReleaseStretch(statusBuf, 3);
         } else {
             ESP_LOGI(TAG, "I2C mailbox TX STATUS=%u len=%u", st, respLen);
         }
@@ -531,26 +577,26 @@ static void i2cMailboxPumpTx(void)
     if (reg == VOREO_REG_DATA) {
         /* 未显式选中 DATA 时不抽应答，避免 begin 后残留 on_request 把角度包抽空 */
         if (!i2cDataArmed || i2cLinkStatus != VOREO_I2C_LINK_READY || i2cSlaveSendDataLen == 0) {
-            i2c_slave_write(slave_handle, &dummy, 1, &write_len, 50);
+            i2cSlaveWriteReleaseStretch(&dummy, 1);
             return;
         }
         if (i2cTxDataOffset >= i2cSlaveSendDataLen) {
             i2cDataArmed = false;
             i2cLinkStatus = VOREO_I2C_LINK_IDLE;
             i2cMbReg = VOREO_REG_STATUS;
-            i2c_slave_write(slave_handle, &dummy, 1, &write_len, 50);
+            i2cSlaveWriteReleaseStretch(&dummy, 1);
             return;
         }
         uint16_t remaining = i2cSlaveSendDataLen - i2cTxDataOffset;
         uint16_t chunk = (remaining > I2C_TX_CHUNK_MAX) ? I2C_TX_CHUNK_MAX : remaining;
         esp_err_t err = i2c_slave_write(slave_handle, i2cSlaveSendData + i2cTxDataOffset,
-                                        chunk, &write_len, 0);
+                                        chunk, &write_len, I2C_SLAVE_WRITE_TIMEOUT_MS);
         if (err != ESP_OK || write_len == 0) {
             ESP_LOGW(TAG, "I2C mailbox DATA write fail err=%s", esp_err_to_name(err));
             i2c_slave_write(slave_handle, i2cSlaveSendData + i2cTxDataOffset,
-                            chunk, &write_len, 50);
+                            chunk, &write_len, I2C_SLAVE_WRITE_TIMEOUT_MS);
             if (write_len == 0) {
-                i2c_slave_write(slave_handle, &dummy, 1, &write_len, 50);
+                i2cSlaveWriteReleaseStretch(&dummy, 1);
                 i2cLinkStatus = VOREO_I2C_LINK_ERROR;
                 i2cDataArmed = false;
                 return;
@@ -560,7 +606,7 @@ static void i2cMailboxPumpTx(void)
         ESP_LOGI(TAG, "I2C mailbox TX DATA %lu/%u off=%u",
                  (unsigned long)write_len, i2cSlaveSendDataLen, i2cTxDataOffset);
         if (i2cTxDataOffset >= i2cSlaveSendDataLen) {
-            /* 读完：IDLE，但保留缓冲直到下次 FIFO；指针回到 STATUS */
+            /* 读完：IDLE，指针回到 STATUS */
             i2cDataArmed = false;
             i2cLinkStatus = VOREO_I2C_LINK_IDLE;
             i2cMbReg = VOREO_REG_STATUS;
@@ -570,7 +616,7 @@ static void i2cMailboxPumpTx(void)
         return;
     }
 
-    i2c_slave_write(slave_handle, &dummy, 1, &write_len, 50);
+    i2cSlaveWriteReleaseStretch(&dummy, 1);
 }
 
 /**
@@ -592,6 +638,10 @@ static void i2cProcessUserFrame(const uint8_t *frame, uint16_t frameLen)
         return;
     }
     userParseData(frame, frameLen - 2);
+    /* setSpeed/setVolume/sendText 等无 sendBuf 应答：勿让 STATUS 一直 BUSY */
+    if (commMode == I2C_MODE && i2cLinkStatus == VOREO_I2C_LINK_BUSY) {
+        i2cLinkStatus = VOREO_I2C_LINK_IDLE;
+    }
 }
 
 static void i2cSlaveTask(void *pvParameters)
@@ -612,11 +662,12 @@ static void i2cSlaveTask(void *pvParameters)
         if (i2cExpectedPacketLen > 0 && i2cRxBufferLen > 0 && i2cRxBufferLen < i2cExpectedPacketLen) {
             if (assembleStartTick == 0) {
                 assembleStartTick = xTaskGetTickCount();
-            } else if ((xTaskGetTickCount() - assembleStartTick) > pdMS_TO_TICKS(3000)) {
+            } else if ((xTaskGetTickCount() - assembleStartTick) > pdMS_TO_TICKS(5000)) {
                 ESP_LOGW(TAG, "I2C assemble timeout %u/%u", i2cRxBufferLen, i2cExpectedPacketLen);
                 i2cResetRxAssemble();
                 assembleStartTick = 0;
                 i2cLinkStatus = VOREO_I2C_LINK_ERROR;
+                i2cSlaveClearStretchOnly();
             }
         } else if (i2cExpectedPacketLen == 0 || i2cRxBufferLen == 0) {
             assembleStartTick = 0;
@@ -698,6 +749,8 @@ static void i2cSlaveTask(void *pvParameters)
         memcpy(i2cRxBuffer + i2cRxBufferLen, payload, payloadLen);
         i2cRxBufferLen += payloadLen;
         assembleStartTick = xTaskGetTickCount();
+        /* 任务侧再清一次，防止 ISR 清 stretch 竞态后仍拉低 SCL */
+        i2cSlaveClearStretchOnly();
 
         if (i2cExpectedPacketLen == 0 && i2cRxBufferLen >= 3) {
             if (i2cRxBuffer[0] == USER_UART_CMD_HEAD) {
@@ -1291,6 +1344,9 @@ static bool i2cSlaveReceiveDoneCb(i2c_slave_dev_handle_t i2c_slave, const i2c_sl
         copy_len = I2C_RX_EVENT_MAX;
     }
 
+    /* 写事务结束后尽早放 SCL，但勿在 ISR 里做别的；数据已由驱动交付 */
+    i2c_ll_slave_clear_stretch(i2cSlaveHw());
+
     i2c_slave_event_t evt = {
         .type = I2C_SLAVE_EVT_RX,
         .len = 0,
@@ -1310,15 +1366,29 @@ static bool i2cSlaveRequestDoneCb(i2c_slave_dev_handle_t i2c_slave, const i2c_sl
 {
     (void)i2c_slave;
     (void)evt_data;
-    QueueHandle_t receive_queue = (QueueHandle_t)arg;
-    i2c_slave_event_t evt = {
-        .type = I2C_SLAVE_EVT_TX,
-        .len = 0,
-        .data = {0},
-    };
-    BaseType_t xTaskWoken = 0;
-    xQueueSendFromISR(receive_queue, &evt, &xTaskWoken);
-    return xTaskWoken;
+    i2c_dev_t *hw = i2cSlaveHw();
+    i2c_slave_read_write_status_t rw = i2c_ll_slave_get_read_write_status(hw);
+
+    /* 写：ISR 内清 stretch，不入队（避免任务里误 i2c_slave_write 撞下一包） */
+    if (rw == I2C_SLAVE_WRITE_BY_MASTER) {
+        i2c_ll_slave_clear_stretch(hw);
+        return false;
+    }
+    /* 读：入队泵邮箱 */
+    if (rw == I2C_SLAVE_READ_BY_MASTER) {
+        QueueHandle_t receive_queue = (QueueHandle_t)arg;
+        i2c_slave_event_t evt = {
+            .type = I2C_SLAVE_EVT_TX,
+            .len = 0,
+            .data = {0},
+        };
+        BaseType_t xTaskWoken = 0;
+        xQueueSendFromISR(receive_queue, &evt, &xTaskWoken);
+        return xTaskWoken;
+    }
+    /* 方向未定：只放线，避免 UNO 死等 */
+    i2c_ll_slave_clear_stretch(hw);
+    return false;
 }
 
 
