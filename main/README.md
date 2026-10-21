@@ -114,7 +114,20 @@ Flash：**4MB**，无 `model` 分区（见根目录 `partitions.csv` / `README_M
 | `USER_UART_CMD_GET_ASR_STATE` | `0x08` | ASR 状态 |
 | `USER_UART_CMD_TTS_VOLUME` | `0x09` | TTS 音量（1 字节，`0x00`~`0x0F`） |
 
-用户帧头 `0x55`，发送侧带 CRC16。
+用户帧头 `0x55`，发送侧带 CRC16。应用帧 UART / I2C 共用。
+
+**I2C 寄存器邮箱**（地址 `0x1F`）：
+
+| 寄存器 | 值 | 方向 | 说明 |
+|--------|-----|------|------|
+| `STATUS` | `0x00` | R | Write 选中后 Read 3：`[status][len_h][len_l]` |
+| `DATA` | `0x03` | R | Write 选中后流式 Read 应答帧 |
+| `CTRL` | `0x04` | W | 写 `0x2F`=ABORT |
+| `FIFO` | `0x10` | W | 写 `[0x10][应用帧…]`，可分包 |
+
+STATUS：`0x00` IDLE，`0x01` BUSY，`0x02` READY，`0x03` ERROR。应答先写入从机静态缓冲再置 READY。
+
+载荷：TTS≤128B；ASR≤4096B（`FD 00 A2+len+UTF-8+FF`，新帧覆盖）。
 
 #### 5.4 RGB
 

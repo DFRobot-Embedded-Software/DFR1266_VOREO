@@ -74,11 +74,24 @@
 #define USER_UART_CMD_TTS_VOLUME         (0x09) //TTS音量命令 0x00~0x0F
 
 
-#define I2C_SLAVE_CMD_ERROR               (0x20)
-#define I2C_SLAVE_CMD_GET_LEN             (0x21)  /* STATUS: Write then Read 3 bytes [status][len_h][len_l] */
-#define I2C_SLAVE_CMD_ABORT               (0x2F)  /* clear assemble/TX */
+/*
+ * I2C 寄存器邮箱（Master Write: [reg][data…]；Write [reg] 后 Read）
+ *  0x00 STATUS  R  读 1 或连读 3：[status][len_h][len_l]
+ *  0x01 LEN_H   R
+ *  0x02 LEN_L   R
+ *  0x03 DATA    R  应答帧流式读（偏移由从机维护）
+ *  0x04 CTRL    W  写 0x2F=ABORT
+ *  0x10 FIFO    W  主机写入应用帧 0x55|LEN|CMD|DATA|CRC（可分包）
+ */
+#define VOREO_REG_STATUS                  (0x00)
+#define VOREO_REG_LEN_H                   (0x01)
+#define VOREO_REG_LEN_L                   (0x02)
+#define VOREO_REG_DATA                    (0x03)
+#define VOREO_REG_CTRL                    (0x04)
+#define VOREO_REG_FIFO                    (0x10)
+#define VOREO_REG_CTRL_ABORT              (0x2F)
 
-/* Link STATUS byte0; do NOT name I2C_STATUS_* (clashes with ESP-IDF enum) */
+/* Link STATUS；勿用 I2C_STATUS_*（与 ESP-IDF 冲突） */
 #define VOREO_I2C_LINK_IDLE               (0x00)
 #define VOREO_I2C_LINK_BUSY               (0x01)
 #define VOREO_I2C_LINK_READY              (0x02)
@@ -88,7 +101,7 @@
 #define VOREO_ASR_PAYLOAD_MAX             (4096)  /* ASR 单帧最大字节（UTF-8） */
 
 #define I2C_APP_FRAME_MAX                 (VOREO_ASR_PAYLOAD_MAX + 6)
-#define I2C_TX_CHUNK_MAX                  (28)
+#define I2C_TX_CHUNK_MAX                  (128)  /* 邮箱 DATA 单次泵送上限 */
 #define I2C_RX_EVENT_MAX                  (256)
 
 #define I2C_SLAVE_SEND_STATIC_OK          (0x30)

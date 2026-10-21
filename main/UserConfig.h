@@ -6,6 +6,9 @@
 
 #define LOCAL_DOA_ENABLE                1 // 1=开启声源定位(DOA)，0=关闭
 
+/* -1=读 MODE_GPIO；0=强制 UART；1=强制 I2C（SSL/I2C demo 调试可设 1） */
+#define COMM_MODE_FORCE                 1
+
 #define RGB_GPIO                        9 //RGB指示灯引脚
 #define MODE_GPIO                       21 //通信模式选择按键引脚
 
