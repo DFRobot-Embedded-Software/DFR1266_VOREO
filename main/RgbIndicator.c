@@ -2,6 +2,7 @@
 
 #include "PeripheralCode.h"
 #include "led_strip.h"
+#include <math.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -12,19 +13,35 @@
 #define TAG "RGB_INDICATOR"
 
 /* 开机等待 GAT_CMD_OPEN 超时后红闪再复位 */
-#define RGB_BOOT_OPEN_TIMEOUT_MS        100000  /* 100s内未收到FD 00 A3 FF则红闪5s后复位 */
+#define RGB_BOOT_OPEN_TIMEOUT_MS        100000  /* 100s内未收到GTA正确初始化回包则红灯闪5s后复位 */
 #define RGB_BOOT_FAIL_BLINK_MS          5000    /* 5s */
 #define RGB_BOOT_FAIL_BLINK_HALF_MS     200     /* 0.2s */
 
+/* 状态指示灯：单颗，RMT_CHANNEL_0 */
 static led_strip_t strip = {
     .type = LED_STRIP_WS2812,
     .length = 1,
     .gpio = RGB_GPIO,
+    .channel = RMT_CHANNEL_0,
     .buf = NULL,
 #ifdef LED_STRIP_BRIGHTNESS
     .brightness = 25,
 #endif
 };
+
+/* DOA 圆环：12 颗白灯，RMT_CHANNEL_1，与状态灯分通道 */
+static led_strip_t circleStrip = {
+    .type = LED_STRIP_WS2812,
+    .length = RGB_CIRCLE_LED_COUNT,
+    .gpio = RGB_CIRCLE_GPIO,
+    .channel = RMT_CHANNEL_1,
+    .buf = NULL,
+#ifdef LED_STRIP_BRIGHTNESS
+    .brightness = 40,
+#endif
+};
+
+static bool circleReady = false;
 
 /**
  * RGB 指示灯状态机
@@ -314,11 +331,73 @@ int setRGBColor(rgb_t color)
     return led_strip_flush(&strip);
 }
 
+int rgbCircleClear(void)
+{
+    if (!circleReady) {
+        return -1;
+    }
+    led_strip_fill(&circleStrip, 0, RGB_CIRCLE_LED_COUNT, RGB_BLACK);
+    return led_strip_flush(&circleStrip);
+}
+
+int rgbCircleSetByIndex(uint8_t center)
+{
+    if (!circleReady) {
+        return -1;
+    }
+    center = (uint8_t)(center % RGB_CIRCLE_LED_COUNT);
+
+    led_strip_fill(&circleStrip, 0, RGB_CIRCLE_LED_COUNT, RGB_BLACK);
+    /* 连续 3 颗：center-1, center, center+1（环形） */
+    for (int i = -1; i <= 1; i++) {
+        int idx = ((int)center + i + RGB_CIRCLE_LED_COUNT) % RGB_CIRCLE_LED_COUNT;
+        led_strip_set_pixel(&circleStrip, (size_t)idx, RGB_WHITE);
+    }
+    return led_strip_flush(&circleStrip);
+}
+
+int rgbCircleSetByAngle(float angle_deg)
+{
+    /* 归一化到 [0, 360) */
+    while (angle_deg < 0.0f) {
+        angle_deg += 360.0f;
+    }
+    while (angle_deg >= 360.0f) {
+        angle_deg -= 360.0f;
+    }
+
+    const float sector = 360.0f / (float)RGB_CIRCLE_LED_COUNT; /* 30° */
+    float adjusted = angle_deg - RGB_CIRCLE_ANGLE_OFFSET_DEG;
+    while (adjusted < 0.0f) {
+        adjusted += 360.0f;
+    }
+    while (adjusted >= 360.0f) {
+        adjusted -= 360.0f;
+    }
+    /* 四舍五入到最近灯珠 */
+    int center = (int)floorf((adjusted + sector * 0.5f) / sector) % RGB_CIRCLE_LED_COUNT;
+    return rgbCircleSetByIndex((uint8_t)center);
+}
+
 int rgbIndicatorInit(void)
 {
     led_strip_install();
     int ret = led_strip_init(&strip);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "status LED init fail: %d", ret);
+        return ret;
+    }
+
+    ret = led_strip_init(&circleStrip);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "circle LED init fail: %d", ret);
+        return ret;
+    }
+    circleReady = true;
+    rgbCircleClear();
+
     xTaskCreate(rgbSmTask, "rgbSmTask", 3072, NULL, 4, NULL);
-    ESP_LOGI(TAG, "RGB indicator initialized");
-    return ret;
+    ESP_LOGI(TAG, "RGB indicator+circle(%d) initialized GPIO%d",
+             RGB_CIRCLE_LED_COUNT, RGB_CIRCLE_GPIO);
+    return 0;
 }
