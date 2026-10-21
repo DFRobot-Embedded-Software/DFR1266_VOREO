@@ -14,11 +14,13 @@
 #define I2C_MODE                        1
 
 #define RGB_BLUE                        rgb_from_code(0x00ff)
+#define RGB_BLUE_DIM                    rgb_from_code(0x0040)   /* 启动成功：蓝色低亮 */
 #define RGB_GREEN                       rgb_from_code(0xff00)
 #define RGB_BLACK                       rgb_from_code(0x00)
 #define RGB_YELLOW                      rgb_from_code(0xffff00)
 #define RGB_CYAN                        rgb_from_code(0x00ffff)
 #define RGB_RED                         rgb_from_code(0xff0000)
+#define RGB_WHITE                       rgb_from_code(0xffffff)
 
 
 
@@ -44,11 +46,11 @@
 #define GAT_CMD_HEAD0                    (0xFD)  //头0（模组→主机）
 #define GAT_CMD_HEAD1                    (0x00)  //头1
 #define GAT_CMD_END                      (0xFF) //结束符
-#define GAT_CMD_WAKEUP                   (0xA0) //唤醒通知
+#define GAT_CMD_WAKEUP                   (0xA0) //唤醒/正在听
 #define GAT_CMD_DETECTED                 (0xA1) //识别完成
 #define GAT_CMD_ASR_DATA                 (0xA2) //ASR文本
 #define GAT_CMD_OPEN                     (0xA3) //GTA初始化完成后应答
-#define GAT_CMD_ASR_TIMEOUT              (0xA4) //ASR超时
+#define GAT_CMD_ASR_TIMEOUT              (0xA4) //识别结束/超时 → 进入待机
 #define GAT_CMD_SPEED_ACK                (0xA5) //语速设置应答
 #define GAT_CMD_VOLUME_ACK               (0xA6) //音量设置应答
 #define GAT_CMD_READ_ERROR               (0xAA) //读取错误
