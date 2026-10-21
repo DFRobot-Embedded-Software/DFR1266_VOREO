@@ -4,25 +4,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "rgb.h"
 #include "UserConfig.h"
 #include "UserCode.h"
-
-
+#include "RgbIndicator.h"
 
 #define UART_MODE                       0
 #define I2C_MODE                        1
-
-#define RGB_BLUE                        rgb_from_code(0x00ff)
-#define RGB_BLUE_DIM                    rgb_from_code(0x0040)   /* 启动成功：蓝色低亮 */
-#define RGB_GREEN                       rgb_from_code(0xff00)
-#define RGB_BLACK                       rgb_from_code(0x00)
-#define RGB_YELLOW                      rgb_from_code(0xffff00)
-#define RGB_CYAN                        rgb_from_code(0x00ffff)
-#define RGB_RED                         rgb_from_code(0xff0000)
-#define RGB_WHITE                       rgb_from_code(0xffffff)
-
-
 
 #define UART_READ_BUF_SIZE              1024
 #define UART_DATA_BITS                  UART_DATA_8_BITS
@@ -220,9 +207,6 @@ uint32_t gatDataListGetCount(gat_data_list_t *list);
 
 //初始化外设
 int peripheralInit(void);
-
-//设置RGB灯颜色
-int setRGBColor(rgb_t color);
 
 /** GTA 是否已上报开机 (0xA3) */
 bool gatIsOpen(void);

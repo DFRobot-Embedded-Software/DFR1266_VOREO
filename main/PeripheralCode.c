@@ -1,6 +1,5 @@
 #include "PeripheralCode.h"
 #include "esp_log_timestamp.h"
-#include "led_strip.h"
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -24,11 +23,6 @@
 
 /* 上电后直接向 GTA 发送音量/语速/TTS 三条命令做联调；测完改 0 */
 #define GTA_HOST_CMD_SELFTEST           0
-
-/* 开机等待 GAT_CMD_OPEN 超时后红闪再复位 */
-#define RGB_BOOT_OPEN_TIMEOUT_MS        100000  /* 100s内未收到FD 00 A3 FF则红闪5s后复位 */
-#define RGB_BOOT_FAIL_BLINK_MS          5000 /* 5s */
-#define RGB_BOOT_FAIL_BLINK_HALF_MS     200 /* 0.2s */
 
 // CRC16-CCITT 多项式 (0x1021)
 #define CRC16_POLYNOMIAL 0x1021
@@ -60,12 +54,6 @@ static volatile uint16_t i2cRxBufferLen = 0;
 static volatile uint16_t i2cExpectedPacketLen = 0;
 
 static bool isOpen = false;  /* GTA 上报 FD 00 A3 FF 后为 true */
-
-/** RGB 状态机：由 GAT 帧 / TTS 发送 / SNR9912 命令驱动 */
-static void rgbSmOnGatDone(uint8_t gatCmd);
-static void rgbSmOnTtsSend(void);
-static void rgbSmApplySnrCmd(uint8_t cmd);
-static void rgbSmTask(void *arg);
 
 typedef enum {
     I2C_SLAVE_EVT_RX,
@@ -102,18 +90,6 @@ static struct {
 
 static QueueHandle_t userUartQueue = NULL;
 static QueueHandle_t gtaUartQueue = NULL;
-static void snr9912UartInit(void);
-
-static led_strip_t strip =
-{
-    .type = LED_STRIP_WS2812,
-    .length = 1,
-    .gpio = RGB_GPIO,
-    .buf = NULL,
-#ifdef LED_STRIP_BRIGHTNESS
-    .brightness = 25, // 亮度范围0-255
-#endif
-};
 
 /**
  * @brief 计算CRC16-CCITT校验值
@@ -1416,10 +1392,8 @@ static bool i2cSlaveRequestDoneCb(i2c_slave_dev_handle_t i2c_slave, const i2c_sl
 int peripheralInit(void)
 {
     // 初始化RGB状态机任务（上电白色慢闪，等 A3/A4 进待机蓝低亮）
-    led_strip_install();
-    int ret = led_strip_init(&strip);
-    xTaskCreate(rgbSmTask, "rgbSmTask", 3072, NULL, 4, NULL);
-    
+    int ret = rgbIndicatorInit();
+
     // 初始化GAT数据链表
     gatDataList = gatDataListInit();
     if (!gatDataList) {
@@ -1470,11 +1444,10 @@ int peripheralInit(void)
     //ESP32复位时GTA也同步复位
     gpio_set_level(GAT_RESET_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(1));
-    gpio_set_level(GAT_RESET_GPIO, 1); 
-    
-    //初始化SNR9912 UART
-    snr9912UartInit();
-  
+    gpio_set_level(GAT_RESET_GPIO, 1);
+
+    //初始化SNR9912 UART（与拆分前相同：在 GAT 复位之后）
+    rgbSnrUartInit();
 
     //获取拨码开关的通信模式
     {
@@ -1549,316 +1522,6 @@ int peripheralInit(void)
 #endif
 
     return ret;
-}
-
-/**
- * RGB 指示灯状态机
- *
- *   BOOTING ──A3──► STANDBY ◄──A4── (仅 SNR 未接管时)
- *      │              │
- *      │              ├─ A0 ────────► LISTENING（正在听，紫色呼吸）
- *      │              ├─ 发 DF A0 TTS ► TTS（绿色呼吸）
- *      │              ├─ SNR 0x01 ──► SNR_YELLOW，接管，忽略 GTA 灯效
- *      │              ├─ SNR 0x02 ──► SNR_GREEN_TWICE，退出接管 ──► STANDBY
- *      │              ├─ SNR 0x03 ──► SNR_RED_TWICE，退出接管 ──► STANDBY
- *      │              └─ SNR 0x55/04/05 ► 对应灯效（不改接管标志）
- *      ├─ 启动完成前忽略 SNR / TTS 灯效
- *      └─ 100s 无 A3 ──► BOOT_FAIL（红闪 5s）──► esp_restart()
- */
-typedef enum {
-    /* 上电等待 GTA 就绪：白色慢闪，直到收到 FD 00 A3 FF */
-    RGB_ST_BOOTING = 0,
-    /* 待机就绪：蓝色低亮常亮（A3 启动成功，或 A4 识别结束回待机） */
-    RGB_ST_STANDBY,
-    /* 正在听：紫色呼吸（收到 FD 00 A0 FF 唤醒） */
-    RGB_ST_LISTENING,
-    /* TTS 正在播放：绿色呼吸（本机发送 DF A0 + UTF-8 + FF） */
-    RGB_ST_TTS,
-    /* SNR F4 A1 01 FB：黄色慢闪，并接管灯效（忽略后续 GTA 灯效） */
-    RGB_ST_SNR_YELLOW,
-    /* SNR F4 A1 02 FB：绿色闪两次后回待机，并退出接管 */
-    RGB_ST_SNR_GREEN_TWICE,
-    /* SNR F4 A1 03/04/05 FB：红色闪两次后回待机；03 退出接管 */
-    RGB_ST_SNR_RED_TWICE,
-    /* 开机 100s 未收到 GAT_CMD_OPEN：红色持续闪烁 5s 后软件复位 */
-    RGB_ST_BOOT_FAIL,
-} rgb_state_t;
-
-static volatile rgb_state_t rgbState = RGB_ST_BOOTING;
-static volatile uint32_t rgbSeq = 0;
-static volatile bool rgbSnrOwned = false;  /* F4 A1 01 FB 接管；02/03 退出 */
-
-static void rgbSmTransit(rgb_state_t next)
-{
-    rgbState = next;
-    rgbSeq++;
-    ESP_LOGI(TAG, "RGB SM -> %d", (int)next);
-}
-
-static void rgbSmOnGatDone(uint8_t gatCmd)
-{
-    /* 开机失败红闪阶段不再响应，保证随后复位 */
-    if (rgbState == RGB_ST_BOOT_FAIL) {
-        return;
-    }
-    /* SNR 0x01 接管期间，忽略 GTA 对 RGB 的切换 */
-    if (rgbSnrOwned) {
-        return;
-    }
-    switch (gatCmd) {
-    case GAT_CMD_WAKEUP:        /* FD 00 A0 FF：正在听 → 紫色呼吸 */
-        if (isOpen) {
-            rgbSmTransit(RGB_ST_LISTENING);
-        }
-        break;
-    case GAT_CMD_OPEN:          /* FD 00 A3 FF：启动成功 → 待机就绪 */
-        rgbSmTransit(RGB_ST_STANDBY);
-        break;
-    case GAT_CMD_ASR_TIMEOUT:   /* FD 00 A4 FF：识别结束 → 待机就绪 */
-        if (isOpen) {
-            rgbSmTransit(RGB_ST_STANDBY);
-        }
-        break;
-    default:
-        break;
-    }
-}
-
-static void rgbSmOnTtsSend(void)
-{
-    /* SNR 接管或尚未启动完成时，不切 TTS 灯效 */
-    if (!isOpen || rgbSnrOwned || rgbState == RGB_ST_BOOTING) {
-        return;
-    }
-    rgbSmTransit(RGB_ST_TTS);
-}
-
-static void rgbSmApplySnrCmd(uint8_t cmd)
-{
-    if (!isOpen || rgbState == RGB_ST_BOOTING) {
-        return;
-    }
-    switch (cmd) {
-    case 0x55:  /* F4 A1 55 FB： */
-        break;
-    case 0x01:  /* F4 A1 01 FB：黄慢闪，接管灯效 */
-        rgbSnrOwned = true;
-        rgbSmTransit(RGB_ST_SNR_YELLOW);
-        break;
-    case 0x02:  /* F4 A1 02 FB：绿闪两次，退出接管 */
-        rgbSnrOwned = false;
-        rgbSmTransit(RGB_ST_SNR_GREEN_TWICE);
-        break;
-    case 0x03:  /* F4 A1 03 FB：红闪两次，退出接管 */
-        rgbSnrOwned = false;
-        rgbSmTransit(RGB_ST_SNR_RED_TWICE);
-        break;
-    case 0x04:
-    case 0x05:
-        rgbSmTransit(RGB_ST_SNR_RED_TWICE);
-        break;
-    default:
-        ESP_LOGW(TAG, "未知RGB命令: 0x%02X", cmd);
-        return;
-    }
-    ESP_LOGI(TAG, "RGB SNR cmd: 0x%02X owned=%d", cmd, (int)rgbSnrOwned);
-}
-
-static void rgbSmTask(void *arg)
-{
-    uint32_t seen = 0;
-    const TickType_t bootStart = xTaskGetTickCount();
-
-    while (1) {
-        rgb_state_t st = rgbState;
-        uint32_t seq = rgbSeq;
-
-        switch (st) {
-        /* 上电等待：白慢闪；100s 无 OPEN → 开机失败 */
-        case RGB_ST_BOOTING:
-            if (!isOpen &&
-                (xTaskGetTickCount() - bootStart) >= pdMS_TO_TICKS(RGB_BOOT_OPEN_TIMEOUT_MS)) {
-                ESP_LOGE(TAG, "GAT_CMD_OPEN timeout %d ms", RGB_BOOT_OPEN_TIMEOUT_MS);
-                rgbSmTransit(RGB_ST_BOOT_FAIL);
-                break;
-            }
-            seen = seq;
-            setRGBColor(RGB_WHITE);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            if (rgbSeq != seen) {
-                break;
-            }
-            setRGBColor(RGB_BLACK);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            break;
-
-        /* 开机失败：红闪 5s 后软件复位 */
-        case RGB_ST_BOOT_FAIL: {
-            TickType_t failStart = xTaskGetTickCount();
-            while ((xTaskGetTickCount() - failStart) < pdMS_TO_TICKS(RGB_BOOT_FAIL_BLINK_MS)) {
-                setRGBColor(RGB_RED);
-                vTaskDelay(pdMS_TO_TICKS(RGB_BOOT_FAIL_BLINK_HALF_MS));
-                setRGBColor(RGB_BLACK);
-                vTaskDelay(pdMS_TO_TICKS(RGB_BOOT_FAIL_BLINK_HALF_MS));
-            }
-            ESP_LOGE(TAG, "boot fail, esp_restart()");
-            esp_restart();
-            break;
-        }
-
-        /* 待机就绪：蓝低亮常亮 */
-        case RGB_ST_STANDBY:
-            setRGBColor(RGB_BLUE_DIM);
-            seen = seq;
-            vTaskDelay(pdMS_TO_TICKS(50));
-            break;
-
-        /* 正在听：紫色呼吸 */
-        case RGB_ST_LISTENING: {
-            seen = seq;
-            for (int v = 8; v <= 255; v += 8) {
-                if (rgbSeq != seen) {
-                    break;
-                }
-                setRGBColor((rgb_t){ .r = (uint8_t)v, .g = 0, .b = (uint8_t)v });
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-            for (int v = 255; v >= 8; v -= 8) {
-                if (rgbSeq != seen) {
-                    break;
-                }
-                setRGBColor((rgb_t){ .r = (uint8_t)v, .g = 0, .b = (uint8_t)v });
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-            break;
-        }
-
-        /* TTS 播放：绿色呼吸 */
-        case RGB_ST_TTS: {
-            seen = seq;
-            for (int g = 8; g <= 255; g += 8) {
-                if (rgbSeq != seen) {
-                    break;
-                }
-                setRGBColor((rgb_t){ .r = 0, .g = (uint8_t)g, .b = 0 });
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-            for (int g = 255; g >= 8; g -= 8) {
-                if (rgbSeq != seen) {
-                    break;
-                }
-                setRGBColor((rgb_t){ .r = 0, .g = (uint8_t)g, .b = 0 });
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-            break;
-        }
-
-        /* SNR 黄慢闪（接管中） */
-        case RGB_ST_SNR_YELLOW:
-            seen = seq;
-            setRGBColor(RGB_YELLOW);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            if (rgbSeq != seen) {
-                break;
-            }
-            setRGBColor(RGB_BLACK);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            break;
-
-        /* SNR 绿/红闪两次后回待机 */
-        case RGB_ST_SNR_GREEN_TWICE:
-        case RGB_ST_SNR_RED_TWICE: {
-            rgb_t color = (st == RGB_ST_SNR_GREEN_TWICE) ? RGB_GREEN : RGB_RED;
-            seen = seq;
-            for (int i = 0; i < 2; i++) {
-                if (rgbSeq != seen) {
-                    break;
-                }
-                setRGBColor(color);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                if (rgbSeq != seen) {
-                    break;
-                }
-                setRGBColor(RGB_BLACK);
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
-            if (rgbSeq == seen) {
-                rgbSmTransit(RGB_ST_STANDBY);
-            }
-            break;
-        }
-
-        default:
-            setRGBColor(RGB_BLACK);
-            seen = seq;
-            vTaskDelay(pdMS_TO_TICKS(50));
-            break;
-        }
-    }
-}
-
-static void snr9912UartTask(void *arg)
-{
-    uint8_t buf[64];
-    int state = 0;
-    uint8_t data = 0;
-
-    while (1) {
-        int n = uart_read_bytes(SNR9912_UART_PORT, buf, sizeof(buf), pdMS_TO_TICKS(20));
-        for (int i = 0; i < n; i++) {
-            uint8_t b = buf[i];
-            if (state == 0) {
-                if (b == 0xF4) {
-                    state = 1;
-                }
-            } else if (state == 1) {
-                if (b == 0xA1) {
-                    state = 2;
-                } else {
-                    state = (b == 0xF4) ? 1 : 0;
-                }
-            } else if (state == 2) {
-                data = b;
-                state = 3;
-            } else {
-                if (b == 0xFB) {
-                    rgbSmApplySnrCmd(data);
-                }
-                state = (b == 0xF4) ? 1 : 0;
-            }
-        }
-    }
-}
-
-static void snr9912UartInit(void)
-{
-    if (!uart_is_driver_installed(SNR9912_UART_PORT)) {
-        uart_config_t config = {
-            .baud_rate = SNR9912_UART_BAUDRATE,
-            .data_bits = UART_DATA_BITS,
-            .stop_bits = UART_STOP_BITS,
-            .parity = UART_PARITY,
-            .flow_ctrl = UART_FLOW_CTRL,
-            .source_clk = UART_SOURCE_CLK,
-        };
-        ESP_ERROR_CHECK(uart_driver_install(SNR9912_UART_PORT, UART_BUF_SIZE, 0, 0, NULL, 0));
-        ESP_ERROR_CHECK(uart_param_config(SNR9912_UART_PORT, &config));
-    }
-    ESP_ERROR_CHECK(uart_set_pin(SNR9912_UART_PORT, SNR9912_UART_TX_GPIO, SNR9912_UART_RX_GPIO,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    xTaskCreate(snr9912UartTask, "snr9912UartTask", 3072, NULL, 5, NULL);
-    ESP_LOGI(TAG, "SNR9912 UART GPIO%d/GPIO%d %d", SNR9912_UART_TX_GPIO, SNR9912_UART_RX_GPIO, SNR9912_UART_BAUDRATE);
-}
-
-/**
- * @brief 设置RGB灯颜色
- * @param color RGB颜色值
- * @return 成功返回0，失败返回非0
- */
-int setRGBColor(rgb_t color)
-{
-    led_strip_set_pixel(&strip, 0, color);
-    return led_strip_flush(&strip);
 }
 
 bool gatIsOpen(void)

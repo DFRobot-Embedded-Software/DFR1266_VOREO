@@ -2,7 +2,7 @@
 #include "UserConfig.h"
 #include "UserCode.h"
 #include "PeripheralCode.h"
-#include "rgb.h"
+#include "RgbIndicator.h"
 
 void app_main(void)
 {
