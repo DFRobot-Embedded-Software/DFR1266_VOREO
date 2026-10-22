@@ -67,7 +67,7 @@ int rgbCircleSetByIndex(uint8_t center);
  */
 int rgbCircleSetByAngle(float angle_deg);
 
-/** GAT 短帧解析完成时驱动灯效（A0/A3/A4 等） */
+/** GAT 短帧解析完成时驱动灯效（A0/A3/A4/AC 等） */
 void rgbSmOnGatDone(uint8_t gatCmd);
 
 /** 本机向 GTA 发送 TTS（DF A0）时切到绿色呼吸 */

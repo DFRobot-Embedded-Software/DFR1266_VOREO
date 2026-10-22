@@ -920,6 +920,11 @@ static void gtaParseData(const uint8_t *data, size_t len)
                 gatParseState.lastCmd = GAT_CMD_VOLUME_ACK;
                 gatParseState.cmdState = GAT_UART_CMD_END;
                 break;
+            case GAT_CMD_TTS_DONE:
+                ESP_LOGI(TAG, "GTA TTS done (0xAC)");
+                gatParseState.lastCmd = GAT_CMD_TTS_DONE;
+                gatParseState.cmdState = GAT_UART_CMD_END;
+                break;
             default:
                 ESP_LOGW(TAG, "Unknown GTA command received: 0x%02X, reset state", data[i]);
                 gatParseState.cmdState = GAT_UART_CMD_HEAD0; // 重置状态，避免卡住

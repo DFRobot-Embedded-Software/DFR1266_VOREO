@@ -41,6 +41,7 @@
 #define GAT_CMD_SPEED_ACK                (0xA5) //语速设置应答
 #define GAT_CMD_VOLUME_ACK               (0xA6) //音量设置应答
 #define GAT_CMD_READ_ERROR               (0xAA) //读取错误
+#define GAT_CMD_TTS_DONE                 (0xAC) //TTS播放完成 → 进入待机
 
 /** 主机→模组：帧头 DF + 命令 + 数据 + FF */
 #define GAT_HOST_HEAD                    (0xDF)

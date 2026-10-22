@@ -46,10 +46,10 @@ static bool circleReady = false;
 /**
  * RGB 指示灯状态机
  *
- *   BOOTING ──A3──► STANDBY ◄──A4── (仅 SNR 未接管时)
+ *   BOOTING ──A3──► STANDBY ◄──A4/AC── (仅 SNR 未接管时；AC=TTS播完)
  *      │              │
  *      │              ├─ A0 ────────► LISTENING（正在听，紫色呼吸）
- *      │              ├─ 发 DF A0 TTS ► TTS（绿色呼吸）
+ *      │              ├─ 发 DF A0 TTS ► TTS（绿色呼吸）──AC──► STANDBY
  *      │              ├─ SNR 0x01 ──► SNR_YELLOW，接管，忽略 GTA 灯效
  *      │              ├─ SNR 0x02 ──► SNR_GREEN_TWICE，退出接管 ──► STANDBY
  *      │              ├─ SNR 0x03 ──► SNR_RED_TWICE，退出接管 ──► STANDBY
@@ -58,13 +58,21 @@ static bool circleReady = false;
  *      └─ 100s 无 A3 ──► BOOT_FAIL（红闪 5s）──► esp_restart()
  */
 typedef enum {
+    /* 上电等待 GTA：白色慢闪 */
     RGB_ST_BOOTING = 0,
+    /* 待机就绪：蓝色低亮常亮 */
     RGB_ST_STANDBY,
+    /* 正在听：紫色呼吸（FD 00 A0 FF） */
     RGB_ST_LISTENING,
+    /* TTS 播放中：绿色呼吸（发 DF A0）；FD 00 AC FF 后回待机 */
     RGB_ST_TTS,
+    /* SNR 0x01：黄慢闪并接管 */
     RGB_ST_SNR_YELLOW,
+    /* SNR 0x02：绿闪两次后回待机并退出接管 */
     RGB_ST_SNR_GREEN_TWICE,
+    /* SNR 0x03/04/05：红闪两次；03 退出接管 */
     RGB_ST_SNR_RED_TWICE,
+    /* 开机超时失败：红闪 5s 后复位 */
     RGB_ST_BOOT_FAIL,
 } rgb_state_t;
 
@@ -96,7 +104,12 @@ void rgbSmOnGatDone(uint8_t gatCmd)
     case GAT_CMD_OPEN:
         rgbSmTransit(RGB_ST_STANDBY);
         break;
-    case GAT_CMD_ASR_TIMEOUT:
+    case GAT_CMD_ASR_TIMEOUT:   /* FD 00 A4 FF：识别结束 → 待机 */
+        if (gatIsOpen()) {
+            rgbSmTransit(RGB_ST_STANDBY);
+        }
+        break;
+    case GAT_CMD_TTS_DONE:      /* FD 00 AC FF：TTS 播放完成 → 待机 */
         if (gatIsOpen()) {
             rgbSmTransit(RGB_ST_STANDBY);
         }
