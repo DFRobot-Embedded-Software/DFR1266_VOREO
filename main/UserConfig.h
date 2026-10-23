@@ -4,7 +4,7 @@
 #define ES7210
 //#define ES7243E
 
-#define LOCAL_DOA_ENABLE                0 // 1=开启声源定位(DOA)，0=关闭
+#define LOCAL_DOA_ENABLE                1 // 1=开启声源定位(DOA)，0=关闭
 #define LOCAL_ASR_WAKEUP_ENABLE         1 // 1=开启ESP32英文MultiNet唤醒，0=关闭
 
 #define ESP_MN_CH_MODEL                 0 // 中文 MultiNet（拼音命令词，串口 SET_ASR 可改）

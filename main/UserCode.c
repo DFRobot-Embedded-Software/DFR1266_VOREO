@@ -32,6 +32,11 @@
 esp_codec_dev_handle_t record_dev = NULL;
 static QueueHandle_t audio_queue = NULL;
 
+typedef struct {
+    int16_t *data;
+    size_t bytes;
+} doa_frame_t;
+
 #if LOCAL_ASR_WAKEUP_ENABLE
 srmodel_list_t *models = NULL;
 static const esp_afe_sr_iface_t *afe_handle = NULL;
@@ -598,35 +603,58 @@ static void processOneFrame() {
 }
 
 /**
+ * @brief 入队一帧 DOA 音频。队列满时丢掉最旧的一帧。
+ */
+static void doaQueueSend(int16_t *audio_data, size_t bytes)
+{
+    if (!audio_queue || !audio_data || bytes == 0) {
+        free(audio_data);
+        return;
+    }
+
+    doa_frame_t frame = {
+        .data = audio_data,
+        .bytes = bytes,
+    };
+    if (xQueueSend(audio_queue, &frame, pdMS_TO_TICKS(10)) == pdPASS) {
+        return;
+    }
+
+    doa_frame_t old = {0};
+    if (xQueueReceive(audio_queue, &old, 0) == pdPASS) {
+        free(old.data);
+        if (xQueueSend(audio_queue, &frame, 0) == pdPASS) {
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "DOA队列满，丢弃音频数据帧");
+    free(audio_data);
+}
+
+/**
  * @brief 音频DOA（到达方向）计算任务
  * @param arg 任务参数（未使用）
  */
 void audioDoaTask(void *arg)
 {
-    size_t bytes_to_read = sizeof(int16_t) * FRAME_SIZE * CHANNELS;
+    const size_t frame_bytes = sizeof(int16_t) * FRAME_SIZE * CHANNELS;
     while (1) {
-        
-        int16_t *audio_data = NULL;
-        // Receive pointer from queue
-        if(xQueueReceive(audio_queue, &audio_data, portMAX_DELAY) != pdPASS) {
+        doa_frame_t frame = {0};
+        if (xQueueReceive(audio_queue, &frame, portMAX_DELAY) != pdPASS) {
             ESP_LOGE(TAG, "Failed to receive audio data from queue");
             continue;
         }
-        
-        if (!audio_data) {
-            ESP_LOGE(TAG, "Received NULL audio data pointer");
+
+        if (!frame.data || frame.bytes != frame_bytes) {
+            ESP_LOGE(TAG, "DOA frame %u bytes, expect %u",
+                     (unsigned)frame.bytes, (unsigned)frame_bytes);
+            free(frame.data);
             continue;
         }
-        
-        // 将队列接收的数据复制到处理缓冲区
-        memcpy(raw_i2s_buf, audio_data, bytes_to_read);
-        
-        // 处理音频帧进行DOA计算
+
+        memcpy(raw_i2s_buf, frame.data, frame_bytes);
         processOneFrame();
-        
-        // 释放内存（由 doaFeedTask 分配）
-        free(audio_data);
-        audio_data = NULL;
+        free(frame.data);
 
         // 减少延迟，提高处理速度，避免队列积压
         vTaskDelay(1);
@@ -683,29 +711,13 @@ static void doaFeedTask(void *arg)
         //     }
         // }
 
-        if (!audio_queue) {
-            continue;
-        }
-
-        int16_t *audio_data = malloc(audio_data_size);
-        if (!audio_data) {
-            ESP_LOGE(TAG, "doaFeedTask: Failed to malloc audio data");
-            continue;
-        }
-        memcpy(audio_data, i2s_buff_16, audio_data_size);
-
-        BaseType_t queue_result = xQueueSend(audio_queue, &audio_data, pdMS_TO_TICKS(10));
-        if (queue_result != pdPASS) {
-            int16_t *old_data = NULL;
-            if (xQueueReceive(audio_queue, &old_data, 0) == pdPASS) {
-                if (old_data) {
-                    free(old_data);
-                }
-                queue_result = xQueueSend(audio_queue, &audio_data, 0);
-            }
-            if (queue_result != pdPASS) {
-                ESP_LOGW(TAG, "DOA队列满，丢弃音频数据帧");
-                free(audio_data);
+        if (audio_queue) {
+            int16_t *audio_data = malloc(audio_data_size);
+            if (!audio_data) {
+                ESP_LOGE(TAG, "doaFeedTask: Failed to malloc audio data");
+            } else {
+                memcpy(audio_data, i2s_buff_16, audio_data_size);
+                doaQueueSend(audio_data, audio_data_size);
             }
         }
         vTaskDelay(1);
@@ -755,27 +767,53 @@ static void feedTask(void *arg)
 
     size_t audio_data_size = audio_chunksize * sizeof(int16_t) * hw_channels;
 
+#if LOCAL_DOA_ENABLE
+    /* AFE 一块通常短于 DOA 的 FRAME_SIZE。按块拼满再入队，避免 DOA 读过 malloc 末尾。 */
+    int16_t *doa_acc = NULL;
+    int doa_filled = 0;
+    if (audio_queue && hw_channels == CHANNELS && audio_chunksize > 0) {
+        doa_acc = malloc(sizeof(int16_t) * FRAME_SIZE * CHANNELS);
+        if (doa_acc) {
+            ESP_LOGI(TAG, "DOA assemble chunk=%d -> frame=%d ch=%d",
+                     audio_chunksize, FRAME_SIZE, CHANNELS);
+        } else {
+            ESP_LOGE(TAG, "DOA accumulator malloc failed");
+        }
+    } else if (audio_queue && hw_channels != CHANNELS) {
+        ESP_LOGW(TAG, "DOA not fed: hw_ch=%d CHANNELS=%d", hw_channels, CHANNELS);
+    }
+#endif
+
     while (1) {
         esp_codec_dev_read(record_dev, i2s_buff_16, audio_data_size);
 
-        if (audio_queue) {
-            int16_t *audio_data = malloc(audio_data_size);
-            if (audio_data) {
-                memcpy(audio_data, i2s_buff_16, audio_data_size);
-                BaseType_t queue_result = xQueueSend(audio_queue, &audio_data, pdMS_TO_TICKS(10));
-                if (queue_result != pdPASS) {
-                    int16_t *old_data = NULL;
-                    if (xQueueReceive(audio_queue, &old_data, 0) == pdPASS) {
-                        free(old_data);
-                        queue_result = xQueueSend(audio_queue, &audio_data, 0);
+#if LOCAL_DOA_ENABLE
+        if (doa_acc) {
+            int src = 0;
+            int remain = audio_chunksize;
+            while (remain > 0) {
+                int space = FRAME_SIZE - doa_filled;
+                int n = (remain < space) ? remain : space;
+                memcpy(doa_acc + (doa_filled * CHANNELS),
+                       i2s_buff_16 + (src * hw_channels),
+                       (size_t)n * CHANNELS * sizeof(int16_t));
+                doa_filled += n;
+                src += n;
+                remain -= n;
+                if (doa_filled == FRAME_SIZE) {
+                    const size_t frame_bytes = sizeof(int16_t) * FRAME_SIZE * CHANNELS;
+                    int16_t *audio_data = malloc(frame_bytes);
+                    if (!audio_data) {
+                        ESP_LOGE(TAG, "feedTask: DOA frame malloc failed");
+                    } else {
+                        memcpy(audio_data, doa_acc, frame_bytes);
+                        doaQueueSend(audio_data, frame_bytes);
                     }
-                    if (queue_result != pdPASS) {
-                        ESP_LOGW(TAG, "DOA queue full, drop frame");
-                        free(audio_data);
-                    }
+                    doa_filled = 0;
                 }
             }
         }
+#endif
 
         for (int i = 0; i < audio_chunksize; i++) {
             afe_buff_16[i] = i2s_buff_16[i * hw_channels + AFE_MIC_SLOT];
@@ -983,7 +1021,7 @@ void initAudioDoa(void)
 #else
     initHannWindow(hann_win, FRAME_SIZE);
     dsps_fft2r_init_fc32(NULL, FRAME_SIZE);
-    audio_queue = xQueueCreate(20, sizeof(int16_t *));
+    audio_queue = xQueueCreate(20, sizeof(doa_frame_t));
     if (!audio_queue) {
         ESP_LOGE(TAG, "创建音频队列失败");
         return;
