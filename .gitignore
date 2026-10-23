@@ -1,5 +1,6 @@
 # Build outputs
 /build/
+/managed_components/
 **/build/
 *.elf
 *.bin
