@@ -1,7 +1,7 @@
 # main 目录功能说明
 
 本目录为 DFR1266_VOREO 固件应用层：四麦采集、声源定位（DOA）、与 GAT 模块/上位机通信、RGB 指示。  
-**ESP32 本地唤醒 / AFE（esp-sr）已移除**；唤醒与 ASR 文本由 GAT 模组完成。
+**ESP32 本地英文 MultiNet 唤醒已恢复**（AFE 无 AEC/WakeNet）；命中拉 GPIO47。GAT 仍负责 ASR 文本/TTS。
 
 ## 文件一览
 
@@ -28,7 +28,7 @@ app_main()
   └─ initAudioDoa()         // LOCAL_DOA_ENABLE=1 时：doa_feed + audio_doa_task
 ```
 
-Flash：**4MB**，无 `model` 分区（见根目录 `partitions.csv` / `README_MERGE_BIN.md`）。
+Flash：**16MB**，含 `model` 分区（英文 MultiNet；见 `partitions.csv` / `README_MERGE_BIN.md`）。
 
 ---
 
@@ -109,7 +109,7 @@ Flash：**4MB**，无 `model` 分区（见根目录 `partitions.csv` / `README_M
 | `USER_UART_CMD_SEND_TEXT` | `0x03` | 发文本（转 TTS） |
 | `USER_UART_CMD_ANGLE` | `0x04` | 角度 |
 | `USER_UART_CMD_DISTANCE` | `0x05` | 距离 |
-| `USER_UART_CMD_SET_ASR` | `0x06` | 已忽略（无 ESP32 本地 ASR） |
+| `USER_UART_CMD_SET_ASR` | `0x06` | 设置英文唤醒词（MultiNet grapheme） |
 | `USER_UART_CMD_TTS_SPEED` | `0x07` | TTS 语速（1 字节，`0x00`~`0x0F`） |
 | `USER_UART_CMD_GET_ASR_STATE` | `0x08` | ASR 状态 |
 | `USER_UART_CMD_TTS_VOLUME` | `0x09` | TTS 音量（1 字节，`0x00`~`0x0F`） |

@@ -6,6 +6,16 @@
 #include "esp_log.h"
 #include "dsps_fft2r.h"
 #include <string.h>
+#include "driver/gpio.h"
+
+#if LOCAL_ASR_WAKEUP_ENABLE
+#include "esp_afe_sr_iface.h"
+#include "esp_afe_sr_models.h"
+#include "esp_mn_iface.h"
+#include "esp_mn_models.h"
+#include "esp_mn_speech_commands.h"
+#include "model_path.h"
+#endif
 
 #include "AudioInitialization.h"
 
@@ -21,6 +31,11 @@
 esp_codec_dev_handle_t record_dev = NULL;
 static QueueHandle_t audio_queue = NULL;
 
+#if LOCAL_ASR_WAKEUP_ENABLE
+srmodel_list_t *models = NULL;
+static const esp_afe_sr_iface_t *afe_handle = NULL;
+#endif
+
 // 物理坐标（米），阵列布局：
 //   M2 ---- M1   (y = +0.025)
 //   |        |
@@ -31,8 +46,8 @@ static const float mic_y[4] = { +0.025f, +0.025f, -0.025f, -0.025f };
 static const float mic_z[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
 /* ----------------- Buffers ----------------- */
-/* raw I2S buffer: assuming 32-bit words and interleaved samples [ch0,ch1,ch2,ch3,...] */
-static int32_t raw_i2s_buf[FRAME_SIZE * CHANNELS]; // <-- ensure size fits memory
+/* raw I2S buffer: 16-bit interleaved [ch0,ch1,ch2,ch3,...] */
+static int16_t raw_i2s_buf[FRAME_SIZE * CHANNELS];
 
 /* per-channel float circular buffer (we'll just fill frame-by-frame in this example) */
 static float ch_frame[CHANNELS][FRAME_SIZE];
@@ -75,7 +90,12 @@ void initMIC(void)
     esp_codec_dev_sample_info_t fs = {
         .sample_rate = 16000,
         .channel = 4,
-        .bits_per_sample = 32,
+        .bits_per_sample = 16,
+        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) |
+                        ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1) |
+                        ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2) |
+                        ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3),
+        .mclk_multiple = 256,
     };
 #endif
     ret = esp_codec_dev_open(record_dev, &fs);
@@ -84,14 +104,17 @@ void initMIC(void)
         return;
     }
 
-    // ret = esp_codec_dev_set_in_gain(record_dev, 30.0);
-    // if (ret != 0) {
-    //     return;
-    // }
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), 10.0);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), 10.0);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2), 10.0);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3), 10.0);
+#ifdef ES7210
+    esp_codec_dev_set_in_channel_gain(record_dev,
+                                      ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) |
+                                      ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1) |
+                                      ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2) |
+                                      ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3),
+                                      36);
+#else
+    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), 36);
+    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), 36);
+#endif
 
 }
 
@@ -112,22 +135,18 @@ void autodetectSlotMapping(void)
         for (int s=0;s<CHANNELS;s++) slot_energy[s]=0.0f;
         for (int f=0; f<num_frames; ++f) {
             size_t bytes_read = 0;
-            size_t to_read = sizeof(int32_t) * FRAME_SIZE * CHANNELS;
-            int32_t *raw_i2s_buf = malloc(to_read);
-            assert(raw_i2s_buf);
-            esp_codec_dev_read(record_dev, raw_i2s_buf, to_read);
-            // if (r != ESP_OK) {
-            //     ESP_LOGW(TAG, "i2s_read during autodetect failed %d", r);
-            //     continue;
-            // }
-            // compute slot energy directly from raw slots (int32)
+            size_t to_read = sizeof(int16_t) * FRAME_SIZE * CHANNELS;
+            int16_t *raw = malloc(to_read);
+            assert(raw);
+            esp_codec_dev_read(record_dev, raw, to_read);
             for (int i=0;i<FRAME_SIZE;i++){
                 int idx = i*CHANNELS;
                 for (int s=0;s<CHANNELS;s++){
-                    float v = (float)raw_i2s_buf[idx + s] * (1.0f/2147483648.0f);
+                    float v = (float)raw[idx + s] * (1.0f/32768.0f);
                     slot_energy[s] += v*v;
                 }
             }
+            free(raw);
         }
         // find slot with maximum energy -> assign to target_mic
         int best_slot = 0;
@@ -220,13 +239,10 @@ static float tdoaTdGcc(const float *a, const float *b, int n, int maxLag, int fs
 }
 
 /**
- * @brief 将int32原始缓冲区解交织为每通道的浮点帧（假设按槽位顺序）
- * @param raw 原始int32缓冲区
- * @param frames 帧数
- * @param out 输出的每通道浮点数组
+ * @brief 将 int16 原始缓冲区解交织为每通道的浮点帧（按槽位顺序）
  */
-static void deinterleaveInt32ToFloat(int32_t *raw, int frames, float out[CHANNELS][FRAME_SIZE]) {
-    const float scale = 1.0f / 2147483648.0f;
+static void deinterleaveInt16ToFloat(int16_t *raw, int frames, float out[CHANNELS][FRAME_SIZE]) {
+    const float scale = 1.0f / 32768.0f;
     for (int i=0;i<frames;i++) {
         int base = i * CHANNELS;
         for (int s=0;s<CHANNELS;s++) {
@@ -522,8 +538,7 @@ static void kalmanUpdateAngle(kalman_ang_t *kf, float meas_deg) {
  * @brief 处理一帧音频数据（DOA计算）
  */
 static void processOneFrame() {
-    // 1) 根据slot2mic映射将原始int32数据解交织为ch_frame（浮点）
-    deinterleaveInt32ToFloat(raw_i2s_buf, FRAME_SIZE, ch_frame);
+    deinterleaveInt16ToFloat(raw_i2s_buf, FRAME_SIZE, ch_frame);
 
     // 2) 计算每通道能量和VAD（语音活动检测）
     float total_e = 0.0f;
@@ -585,10 +600,10 @@ static void processOneFrame() {
  */
 void audioDoaTask(void *arg)
 {
-    size_t bytes_to_read = sizeof(int32_t) * FRAME_SIZE * CHANNELS;
+    size_t bytes_to_read = sizeof(int16_t) * FRAME_SIZE * CHANNELS;
     while (1) {
         
-        int32_t *audio_data = NULL;
+        int16_t *audio_data = NULL;
         // Receive pointer from queue
         if(xQueueReceive(audio_queue, &audio_data, portMAX_DELAY) != pdPASS) {
             ESP_LOGE(TAG, "Failed to receive audio data from queue");
@@ -617,9 +632,9 @@ void audioDoaTask(void *arg)
 }
 
 
-#if LOCAL_DOA_ENABLE
+#if LOCAL_DOA_ENABLE && !LOCAL_ASR_WAKEUP_ENABLE
 /**
- * @brief DOA 专用采麦任务
+ * @brief DOA 专用采麦任务（仅在无本地唤醒时使用；有唤醒时由 feedTask 供数）
  */
 static void doaFeedTask(void *arg)
 {
@@ -630,9 +645,9 @@ static void doaFeedTask(void *arg)
         return;
     }
 
-    const size_t audio_data_size = sizeof(int32_t) * FRAME_SIZE * CHANNELS;
-    int32_t *i2s_buff_32 = malloc(audio_data_size);
-    if (!i2s_buff_32) {
+    const size_t audio_data_size = sizeof(int16_t) * FRAME_SIZE * CHANNELS;
+    int16_t *i2s_buff_16 = malloc(audio_data_size);
+    if (!i2s_buff_16) {
         ESP_LOGE(TAG, "doaFeedTask: malloc 失败");
         vTaskDelete(NULL);
         return;
@@ -640,21 +655,45 @@ static void doaFeedTask(void *arg)
 
     ESP_LOGI(TAG, "doaFeedTask started, frame=%d ch=%d", FRAME_SIZE, CHANNELS);
     while (1) {
-        esp_codec_dev_read(record_dev, i2s_buff_32, audio_data_size);
+        esp_codec_dev_read(record_dev, i2s_buff_16, audio_data_size);
+
+        // /* 四麦 peak（int16），约 0.5s 打一次 */
+        // {
+        //     int16_t peak[CHANNELS] = {0};
+        //     for (int i = 0; i < FRAME_SIZE; i++) {
+        //         for (int ch = 0; ch < CHANNELS; ch++) {
+        //             int16_t s = i2s_buff_16[i * CHANNELS + ch];
+        //             if (s < 0) {
+        //                 s = (int16_t)(-s);
+        //             }
+        //             if (s > peak[ch]) {
+        //                 peak[ch] = s;
+        //             }
+        //         }
+        //     }
+        //     static int64_t last_peak_us = 0;
+        //     int64_t now_us = esp_timer_get_time();
+        //     if (last_peak_us == 0 || (now_us - last_peak_us) >= 500000) {
+        //         last_peak_us = now_us;
+        //         ESP_LOGI(TAG, "mic peak: ch0=%d ch1=%d ch2=%d ch3=%d",
+        //                  peak[0], peak[1], peak[2], peak[3]);
+        //     }
+        // }
+
         if (!audio_queue) {
             continue;
         }
 
-        int32_t *audio_data = malloc(audio_data_size);
+        int16_t *audio_data = malloc(audio_data_size);
         if (!audio_data) {
             ESP_LOGE(TAG, "doaFeedTask: Failed to malloc audio data");
             continue;
         }
-        memcpy(audio_data, i2s_buff_32, audio_data_size);
+        memcpy(audio_data, i2s_buff_16, audio_data_size);
 
         BaseType_t queue_result = xQueueSend(audio_queue, &audio_data, pdMS_TO_TICKS(10));
         if (queue_result != pdPASS) {
-            int32_t *old_data = NULL;
+            int16_t *old_data = NULL;
             if (xQueueReceive(audio_queue, &old_data, 0) == pdPASS) {
                 if (old_data) {
                     free(old_data);
@@ -669,8 +708,252 @@ static void doaFeedTask(void *arg)
         vTaskDelay(1);
     }
 
-    free(i2s_buff_32);
+    free(i2s_buff_16);
     vTaskDelete(NULL);
+}
+#endif
+
+#if LOCAL_ASR_WAKEUP_ENABLE
+/**
+ * @brief 采麦 → AFE.feed；若 DOA 已建队列则同时推送
+ */
+static void feedTask(void *arg)
+{
+    esp_afe_sr_data_t *afe_data_local = arg;
+
+    if (!afe_data_local || !afe_handle) {
+        ESP_LOGE(TAG, "feedTask: afe_data or afe_handle is NULL");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int audio_chunksize = afe_handle->get_feed_chunksize(afe_data_local);
+    int nch = afe_handle->get_feed_channel_num(afe_data_local);
+    ESP_LOGI(TAG, "AFE feed chunksize=%d channels=%d", audio_chunksize, nch);
+#ifdef ES7243E
+    int feed_channel = 2;
+#endif
+#ifdef ES7210
+    int feed_channel = 4;
+#endif
+    assert(nch == feed_channel);
+
+    int16_t *i2s_buff_16 = malloc(audio_chunksize * sizeof(int16_t) * feed_channel);
+    if (!i2s_buff_16) {
+        ESP_LOGE(TAG, "feedTask: malloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t audio_data_size = audio_chunksize * sizeof(int16_t) * feed_channel;
+
+    while (1) {
+        esp_codec_dev_read(record_dev, i2s_buff_16, audio_data_size);
+
+        if (audio_queue) {
+            int16_t *audio_data = malloc(audio_data_size);
+            if (audio_data) {
+                memcpy(audio_data, i2s_buff_16, audio_data_size);
+                BaseType_t queue_result = xQueueSend(audio_queue, &audio_data, pdMS_TO_TICKS(10));
+                if (queue_result != pdPASS) {
+                    int16_t *old_data = NULL;
+                    if (xQueueReceive(audio_queue, &old_data, 0) == pdPASS) {
+                        free(old_data);
+                        queue_result = xQueueSend(audio_queue, &audio_data, 0);
+                    }
+                    if (queue_result != pdPASS) {
+                        ESP_LOGW(TAG, "DOA queue full, drop frame");
+                        free(audio_data);
+                    }
+                }
+            }
+        }
+
+        /* 四麦 peak（int16），约 0.5s 打一次 */
+        // {
+        //     int16_t peak[4] = {0, 0, 0, 0};
+        //     for (int i = 0; i < audio_chunksize; i++) {
+        //         for (int ch = 0; ch < feed_channel && ch < 4; ch++) {
+        //             int16_t s = i2s_buff_16[i * feed_channel + ch];
+        //             if (s < 0) {
+        //                 s = (int16_t)(-s);
+        //             }
+        //             if (s > peak[ch]) {
+        //                 peak[ch] = s;
+        //             }
+        //         }
+        //     }
+        //     static int64_t last_peak_us = 0;
+        //     int64_t now_us = esp_timer_get_time();
+        //     if (last_peak_us == 0 || (now_us - last_peak_us) >= 500000) {
+        //         last_peak_us = now_us;
+        //         ESP_LOGI(TAG, "mic peak: ch0=%d ch1=%d ch2=%d ch3=%d",
+        //                  peak[0], peak[1], peak[2], peak[3]);
+        //     }
+        // }
+
+        afe_handle->feed(afe_data_local, i2s_buff_16);
+        vTaskDelay(1);
+    }
+}
+
+/**
+ * @brief AFE.fetch + 英文 MultiNet；命中只拉 GPIO47
+ */
+static void detectTask(void *arg)
+{
+    esp_afe_sr_data_t *afe_data_local = arg;
+
+    if (!afe_data_local || !afe_handle) {
+        ESP_LOGE(TAG, "detectTask: afe_data or afe_handle is NULL");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    static esp_mn_iface_t *multinet = NULL;
+    static model_iface_data_t *model_data = NULL;
+
+#if ESP_MN_EN_MODEL || ESP_MN_CH_MODEL
+    char *mn_name = NULL;
+#if ESP_MN_EN_MODEL
+    mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
+#endif
+#if ESP_MN_CH_MODEL
+    if (!mn_name) {
+        mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
+    }
+#endif
+    if (mn_name) {
+        multinet = esp_mn_handle_from_name(mn_name);
+        if (multinet) {
+            model_data = multinet->create(mn_name, 8000);
+            if (model_data) {
+                esp_mn_commands_alloc(multinet, model_data);
+                esp_mn_commands_clear();
+                /* 英文 MN6：全大写 grapheme；可被 SET_ASR / setWakeWord 覆盖 */
+                esp_mn_commands_add(1, "HI ESP");
+                esp_mn_error_t *mn_err = esp_mn_commands_update();
+                if (mn_err) {
+                    ESP_LOGW(TAG, "default wake word update had errors");
+                }
+            } else {
+                ESP_LOGE(TAG, "multinet->create failed");
+            }
+        } else {
+            ESP_LOGE(TAG, "esp_mn_handle_from_name failed, name=%s", mn_name);
+        }
+    } else {
+        ESP_LOGW(TAG, "MultiNet model not found in srmodels");
+    }
+#endif
+
+    ESP_LOGI(TAG, "detectTask start");
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    uint32_t detect_counter = 0;
+    while (1) {
+        if (!afe_handle || !afe_data_local) {
+            ESP_LOGE(TAG, "detectTask: handle became NULL");
+            break;
+        }
+        afe_fetch_result_t *res = afe_handle->fetch(afe_data_local);
+        if (!res || res->ret_value == ESP_FAIL) {
+            continue;
+        }
+
+        if (multinet && model_data) {
+            detect_counter++;
+            if (detect_counter < 2) {
+                continue;
+            }
+            detect_counter = 0;
+
+            esp_mn_state_t mn_state = multinet->detect(model_data, res->data);
+            if (mn_state == ESP_MN_STATE_DETECTED) {
+                esp_mn_results_t *mn_result = multinet->get_results(model_data);
+                if (mn_result) {
+                    ESP_LOGI(TAG, "wake detected: %s prob=%f", mn_result->string, mn_result->prob[0]);
+                    gpio_set_level(GAT_WAKEUP_ASR_GPIO, 0);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    gpio_set_level(GAT_WAKEUP_ASR_GPIO, 1);
+                }
+            }
+        } else {
+            taskYIELD();
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+void initSpeechRecog(void)
+{
+    models = esp_srmodel_init("model");
+    if (!models) {
+        ESP_LOGE(TAG, "esp_srmodel_init failed");
+        return;
+    }
+#ifdef ES7243E
+    afe_config_t *afe_config = afe_config_init("MM", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+#endif
+#ifdef ES7210
+    afe_config_t *afe_config = afe_config_init("MMNN", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+#endif
+    if (!afe_config) {
+        ESP_LOGE(TAG, "afe_config_init failed");
+        return;
+    }
+    afe_config->wakenet_init = false;
+    afe_config->aec_init = false;
+    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+
+    afe_handle = esp_afe_handle_from_config(afe_config);
+    if (!afe_handle) {
+        ESP_LOGE(TAG, "esp_afe_handle_from_config failed");
+        afe_config_free(afe_config);
+        return;
+    }
+    esp_afe_sr_data_t *afe_data_local = afe_handle->create_from_config(afe_config);
+    afe_config_free(afe_config);
+    if (!afe_data_local) {
+        ESP_LOGE(TAG, "afe create_from_config failed");
+        return;
+    }
+
+    xTaskCreatePinnedToCore(feedTask, "feed", 8 * 1024, (void *)afe_data_local, 4, NULL, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    xTaskCreatePinnedToCore(detectTask, "detect", 8 * 1024, (void *)afe_data_local, 6, NULL, 1);
+    ESP_LOGI(TAG, "Speech wakeup initialized (AFE+EN MultiNet, no AEC)");
+}
+
+void setWakeWord(const char *wake_word)
+{
+    if (!wake_word || wake_word[0] == '\0') {
+        return;
+    }
+    esp_mn_commands_clear();
+    esp_err_t err = esp_mn_commands_add(1, wake_word);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_mn_commands_add failed: %s err=0x%x", wake_word, err);
+        return;
+    }
+    esp_mn_error_t *mn_err = esp_mn_commands_update();
+    if (mn_err) {
+        ESP_LOGW(TAG, "wake word update reported parse errors: %s", wake_word);
+    } else {
+        ESP_LOGI(TAG, "wake word set: %s", wake_word);
+    }
+}
+#endif /* LOCAL_ASR_WAKEUP_ENABLE */
+
+#if !LOCAL_ASR_WAKEUP_ENABLE
+void initSpeechRecog(void)
+{
+    ESP_LOGI(TAG, "ESP32 wake disabled (LOCAL_ASR_WAKEUP_ENABLE=0)");
+}
+
+void setWakeWord(const char *wake_word)
+{
+    (void)wake_word;
 }
 #endif
 
@@ -685,15 +968,19 @@ void initAudioDoa(void)
 #else
     initHannWindow(hann_win, FRAME_SIZE);
     dsps_fft2r_init_fc32(NULL, FRAME_SIZE);
-    // 创建队列用于存储指针(int32_t*)，而不是数据本身
-    audio_queue = xQueueCreate(20, sizeof(int32_t*));
+    audio_queue = xQueueCreate(20, sizeof(int16_t *));
     if (!audio_queue) {
         ESP_LOGE(TAG, "创建音频队列失败");
         return;
     }
 
     xTaskCreate(audioDoaTask, "audio_doa_task", 8 * 1024, NULL, 5, NULL);
+#if LOCAL_ASR_WAKEUP_ENABLE
+    /* 采麦由 feedTask 统一负责并推送 DOA 队列 */
+    ESP_LOGI(TAG, "DOA initialized (audio from AFE feedTask)");
+#else
     xTaskCreatePinnedToCore(doaFeedTask, "doa_feed", 8 * 1024, NULL, 4, NULL, 0);
     ESP_LOGI(TAG, "DOA initialized");
+#endif
 #endif
 }

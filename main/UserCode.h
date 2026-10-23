@@ -30,6 +30,11 @@ extern "C" {
 void initMIC(void);
 
 /**
+ * @brief 初始化本地语音唤醒（AFE + 英文 MultiNet）
+ */
+void initSpeechRecog(void);
+
+/**
  * @brief 初始化音频DOA（到达方向）系统
  */
 void initAudioDoa(void);
@@ -38,6 +43,11 @@ void initAudioDoa(void);
  * @brief 自动检测TDM槽位到物理麦克风的映射关系
  */
 void autodetectSlotMapping(void);
+
+/**
+ * @brief 运行时设置英文唤醒词（grapheme，无数字/特殊字符）
+ */
+void setWakeWord(const char *wake_word);
 
 #ifdef __cplusplus
 }

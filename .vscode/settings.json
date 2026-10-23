@@ -1,7 +1,8 @@
 {
   "idf.pythonInstallPath": "D:\\Espressif5.5.4\\tools\\idf-python\\3.11.2\\python.exe",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32s3"
+    "IDF_TARGET": "esp32s3",
+    "OPENOCD_USB_ADAPTER_LOCATION": "1-5"
   },
   "clangd.path": "D:\\Espressif5.5.4\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [

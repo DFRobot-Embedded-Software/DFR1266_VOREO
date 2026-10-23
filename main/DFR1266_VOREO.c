@@ -13,4 +13,7 @@ void app_main(void)
 #if LOCAL_DOA_ENABLE
     initAudioDoa();
 #endif
+#if LOCAL_ASR_WAKEUP_ENABLE
+    initSpeechRecog();
+#endif
 }

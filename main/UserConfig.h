@@ -4,8 +4,11 @@
 #define ES7210
 //#define ES7243E
 
-#define LOCAL_DOA_ENABLE                1 // 1=开启声源定位(DOA)，0=关闭
+#define LOCAL_DOA_ENABLE                0 // 1=开启声源定位(DOA)，0=关闭
+#define LOCAL_ASR_WAKEUP_ENABLE         1 // 1=开启ESP32英文MultiNet唤醒，0=关闭
 
+#define ESP_MN_CH_MODEL                 0 // 中文 MultiNet（拼音命令词，串口 SET_ASR 可改）
+#define ESP_MN_EN_MODEL                 1 // 英文 MultiNet 自定义唤醒词
 
 #define RGB_GPIO                        9 //RGB指示灯引脚
 #define RGB_CIRCLE_GPIO                 48 //RGB圆环指示灯引脚

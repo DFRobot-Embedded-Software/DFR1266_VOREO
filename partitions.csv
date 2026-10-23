@@ -1,7 +1,7 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-# Flash size: 4MB (0x400000), partition table at 0x8000
-# Available for app: 0x10000 .. 0x400000 = 0x3F0000 (~3968KB)
-# ESP32 本地唤醒/AFE 已移除，不再保留 model 分区
+# Flash size is 16MB (0x1000000), partition table offset at 0x8000
+# factory @ 0x10000 size 0x600000; model @ 0x610000 size 5168K
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x3F0000,
+factory,  app,  factory, 0x10000, 0x600000,
+model,    data, spiffs,  0x610000, 5168K,

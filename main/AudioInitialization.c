@@ -118,7 +118,7 @@ static int i2sInit(uint8_t port, codec_i2s_pin_t *i2s_pin, i2s_clock_src_t clk_s
 #if SOC_I2S_SUPPORTS_TDM
     i2s_tdm_slot_mask_t slot_mask = I2S_TDM_SLOT0 | I2S_TDM_SLOT1 | I2S_TDM_SLOT2 | I2S_TDM_SLOT3;
     i2s_tdm_config_t tdm_cfg = {
-        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(32, I2S_SLOT_MODE_MONO, slot_mask),
+        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(16, I2S_SLOT_MODE_STEREO, slot_mask),
         .clk_cfg  = I2S_TDM_CLK_DEFAULT_CONFIG(16000),
         .gpio_cfg = {
             .mclk = i2s_pin ? i2s_pin->mclk : I2S_MCK_PIN,
@@ -130,7 +130,7 @@ static int i2sInit(uint8_t port, codec_i2s_pin_t *i2s_pin, i2s_clock_src_t clk_s
     };
     tdm_cfg.slot_cfg.total_slot = 4;
     tdm_cfg.clk_cfg.clk_src = clk_src;
-    tdm_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
+    tdm_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
 #endif
 
     int ret = i2s_new_channel(&chan_cfg,
@@ -156,12 +156,12 @@ static int i2sInit(uint8_t port, codec_i2s_pin_t *i2s_pin, i2s_clock_src_t clk_s
     }
 #endif
     ESP_ERROR_CHECK(ret);
-    if (i2s_keep[port]->tx_handle) {
-        ESP_ERROR_CHECK(i2s_channel_enable(i2s_keep[port]->tx_handle));
-    }
-    if (i2s_keep[port]->rx_handle) {
-        ESP_ERROR_CHECK(i2s_channel_enable(i2s_keep[port]->rx_handle));
-    }
+    // if (i2s_keep[port]->tx_handle) {
+    //     ESP_ERROR_CHECK(i2s_channel_enable(i2s_keep[port]->tx_handle));
+    // }
+    // if (i2s_keep[port]->rx_handle) {
+    //     ESP_ERROR_CHECK(i2s_channel_enable(i2s_keep[port]->rx_handle));
+    // }
 
     return ret;
 }
@@ -234,7 +234,10 @@ int initAudio(esp_codec_dev_handle_t *record_dev){
     // New input codec interface
     es7210_codec_cfg_t es7210_cfg = {
         .ctrl_if = in_ctrl_if,
+        .master_mode = false,
         .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4,
+        .mclk_src = ES7210_MCLK_FROM_PAD,
+        .mclk_div = 256,
     };
     const audio_codec_if_t *in_codec_if = es7210_codec_new(&es7210_cfg);
     if (in_codec_if == NULL){
