@@ -19,6 +19,7 @@
 #endif
 
 #include "AudioInitialization.h"
+#include "RgbIndicator.h"
 
 #include "esp_dsp.h"
 #include "esp_timer.h"
@@ -589,11 +590,13 @@ static void processOneFrame() {
     if (az < 0) az += 360.0f;
     angle = az;
 
+
     static int64_t last_log_us = 0;
     int64_t now_us = esp_timer_get_time();
     if (last_log_us != 0 && (now_us - last_log_us) < 500000) {
         return; /* 日志限频 0.5s */
     }
+    rgbCircleSetByAngle(angle);
     float dt_ms = (last_log_us > 0) ? (float)(now_us - last_log_us) / 1000.0f : 0.0f;
     float hz = (dt_ms > 0.0f) ? (1000.0f / dt_ms) : 0.0f;
     last_log_us = now_us;

@@ -64,6 +64,7 @@ int rgbCircleSetByIndex(uint8_t center);
  * @return 成功返回 0，失败返回非 0
  *
  * 映射：360°/12=30° 一格；取最近灯珠为中心，再亮两侧共 3 颗。
+ * 扇区（中心灯珠）未变时直接返回，不重复刷灯。
  */
 int rgbCircleSetByAngle(float angle_deg);
 

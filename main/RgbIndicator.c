@@ -42,6 +42,8 @@ static led_strip_t circleStrip = {
 };
 
 static bool circleReady = false;
+/** 上次按角度点亮的中心灯珠；-1 表示尚未设置（清屏后也会复位） */
+static int s_circleLastCenter = -1;
 
 /**
  * RGB 指示灯状态机
@@ -349,6 +351,7 @@ int rgbCircleClear(void)
     if (!circleReady) {
         return -1;
     }
+    s_circleLastCenter = -1;
     led_strip_fill(&circleStrip, 0, RGB_CIRCLE_LED_COUNT, RGB_BLACK);
     return led_strip_flush(&circleStrip);
 }
@@ -366,7 +369,11 @@ int rgbCircleSetByIndex(uint8_t center)
         int idx = ((int)center + i + RGB_CIRCLE_LED_COUNT) % RGB_CIRCLE_LED_COUNT;
         led_strip_set_pixel(&circleStrip, (size_t)idx, RGB_WHITE);
     }
-    return led_strip_flush(&circleStrip);
+    int ret = led_strip_flush(&circleStrip);
+    if (ret == 0) {
+        s_circleLastCenter = (int)center;
+    }
+    return ret;
 }
 
 int rgbCircleSetByAngle(float angle_deg)
@@ -389,6 +396,9 @@ int rgbCircleSetByAngle(float angle_deg)
     }
     /* 四舍五入到最近灯珠 */
     int center = (int)floorf((adjusted + sector * 0.5f) / sector) % RGB_CIRCLE_LED_COUNT;
+    if (center == s_circleLastCenter) {
+        return 0; /* 扇区未变，跳过刷灯 */
+    }
     return rgbCircleSetByIndex((uint8_t)center);
 }
 
