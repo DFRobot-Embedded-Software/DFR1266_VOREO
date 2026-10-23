@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "UserConfig.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "dsps_fft2r.h"
 #include <string.h>
 #include "driver/gpio.h"
@@ -34,6 +35,8 @@ static QueueHandle_t audio_queue = NULL;
 #if LOCAL_ASR_WAKEUP_ENABLE
 srmodel_list_t *models = NULL;
 static const esp_afe_sr_iface_t *afe_handle = NULL;
+static esp_mn_iface_t *s_multinet = NULL;
+static model_iface_data_t *s_mn_model_data = NULL;
 #endif
 
 // 物理坐标（米），阵列布局：
@@ -112,8 +115,8 @@ void initMIC(void)
                                       ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3),
                                       36);
 #else
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), 36);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), 36);
+    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), 30);
+    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), 30);
 #endif
 
 }
@@ -728,24 +731,29 @@ static void feedTask(void *arg)
     }
 
     int audio_chunksize = afe_handle->get_feed_chunksize(afe_data_local);
-    int nch = afe_handle->get_feed_channel_num(afe_data_local);
-    ESP_LOGI(TAG, "AFE feed chunksize=%d channels=%d", audio_chunksize, nch);
+    int afe_nch = afe_handle->get_feed_channel_num(afe_data_local);
 #ifdef ES7243E
-    int feed_channel = 2;
+    const int hw_channels = 2;
 #endif
 #ifdef ES7210
-    int feed_channel = 4;
+    const int hw_channels = 4; /* Codec 仍读四槽；AFE 只吃 AFE_MIC_SLOT 一路 */
 #endif
-    assert(nch == feed_channel);
+    ESP_LOGI(TAG, "AFE feed chunksize=%d afe_ch=%d hw_ch=%d slot=%d",
+             audio_chunksize, afe_nch, hw_channels, AFE_MIC_SLOT);
+    assert(afe_nch == 1);
+    assert(AFE_MIC_SLOT >= 0 && AFE_MIC_SLOT < hw_channels);
 
-    int16_t *i2s_buff_16 = malloc(audio_chunksize * sizeof(int16_t) * feed_channel);
-    if (!i2s_buff_16) {
+    int16_t *i2s_buff_16 = malloc(audio_chunksize * sizeof(int16_t) * hw_channels);
+    int16_t *afe_buff_16 = malloc(audio_chunksize * sizeof(int16_t));
+    if (!i2s_buff_16 || !afe_buff_16) {
         ESP_LOGE(TAG, "feedTask: malloc failed");
+        free(i2s_buff_16);
+        free(afe_buff_16);
         vTaskDelete(NULL);
         return;
     }
 
-    size_t audio_data_size = audio_chunksize * sizeof(int16_t) * feed_channel;
+    size_t audio_data_size = audio_chunksize * sizeof(int16_t) * hw_channels;
 
     while (1) {
         esp_codec_dev_read(record_dev, i2s_buff_16, audio_data_size);
@@ -769,36 +777,15 @@ static void feedTask(void *arg)
             }
         }
 
-        /* 四麦 peak（int16），约 0.5s 打一次 */
-        // {
-        //     int16_t peak[4] = {0, 0, 0, 0};
-        //     for (int i = 0; i < audio_chunksize; i++) {
-        //         for (int ch = 0; ch < feed_channel && ch < 4; ch++) {
-        //             int16_t s = i2s_buff_16[i * feed_channel + ch];
-        //             if (s < 0) {
-        //                 s = (int16_t)(-s);
-        //             }
-        //             if (s > peak[ch]) {
-        //                 peak[ch] = s;
-        //             }
-        //         }
-        //     }
-        //     static int64_t last_peak_us = 0;
-        //     int64_t now_us = esp_timer_get_time();
-        //     if (last_peak_us == 0 || (now_us - last_peak_us) >= 500000) {
-        //         last_peak_us = now_us;
-        //         ESP_LOGI(TAG, "mic peak: ch0=%d ch1=%d ch2=%d ch3=%d",
-        //                  peak[0], peak[1], peak[2], peak[3]);
-        //     }
-        // }
-
-        afe_handle->feed(afe_data_local, i2s_buff_16);
-        vTaskDelay(1);
+        for (int i = 0; i < audio_chunksize; i++) {
+            afe_buff_16[i] = i2s_buff_16[i * hw_channels + AFE_MIC_SLOT];
+        }
+        afe_handle->feed(afe_data_local, afe_buff_16);
     }
 }
 
 /**
- * @brief AFE.fetch + 英文 MultiNet；命中只拉 GPIO47
+ * @brief AFE.fetch + 英文 MultiNet（对齐 skainet：每帧 detect + TIMEOUT clean）；命中拉 GPIO47
  */
 static void detectTask(void *arg)
 {
@@ -824,18 +811,25 @@ static void detectTask(void *arg)
     }
 #endif
     if (mn_name) {
+        ESP_LOGI(TAG, "multinet:%s", mn_name);
         multinet = esp_mn_handle_from_name(mn_name);
         if (multinet) {
-            model_data = multinet->create(mn_name, 8000);
+            /* 与 en_speech_commands_recognition 一致：超时窗 6000ms */
+            model_data = multinet->create(mn_name, 6000);
             if (model_data) {
+                int afe_chunksize = afe_handle->get_fetch_chunksize(afe_data_local);
+                int mu_chunksize = multinet->get_samp_chunksize(model_data);
+                assert(mu_chunksize == afe_chunksize);
+
                 esp_mn_commands_alloc(multinet, model_data);
                 esp_mn_commands_clear();
-                /* 英文 MN6：全大写 grapheme；可被 SET_ASR / setWakeWord 覆盖 */
+                /* 英文 MN7：全大写 grapheme；可被 SET_ASR / setWakeWord 覆盖 */
                 esp_mn_commands_add(1, "HI ESP");
                 esp_mn_error_t *mn_err = esp_mn_commands_update();
                 if (mn_err) {
                     ESP_LOGW(TAG, "default wake word update had errors");
                 }
+                multinet->print_active_speech_commands(model_data);
             } else {
                 ESP_LOGE(TAG, "multinet->create failed");
             }
@@ -847,10 +841,10 @@ static void detectTask(void *arg)
     }
 #endif
 
-    ESP_LOGI(TAG, "detectTask start");
-    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "detectTask start (always listening)");
 
-    uint32_t detect_counter = 0;
+    /* 与 skainet 一致：不在每帧 vTaskDelay。实时性靠 fetch 阻塞对齐；
+     * 需 240MHz（见 sdkconfig），否则 MN7 忙循环可能再触发 IDLE1 TWDT。 */
     while (1) {
         if (!afe_handle || !afe_data_local) {
             ESP_LOGE(TAG, "detectTask: handle became NULL");
@@ -858,28 +852,33 @@ static void detectTask(void *arg)
         }
         afe_fetch_result_t *res = afe_handle->fetch(afe_data_local);
         if (!res || res->ret_value == ESP_FAIL) {
+            ESP_LOGW(TAG, "afe fetch error");
             continue;
         }
 
-        if (multinet && model_data) {
-            detect_counter++;
-            if (detect_counter < 2) {
-                continue;
-            }
-            detect_counter = 0;
+        if (!multinet || !model_data) {
+            continue;
+        }
 
-            esp_mn_state_t mn_state = multinet->detect(model_data, res->data);
-            if (mn_state == ESP_MN_STATE_DETECTED) {
-                esp_mn_results_t *mn_result = multinet->get_results(model_data);
-                if (mn_result) {
-                    ESP_LOGI(TAG, "wake detected: %s prob=%f", mn_result->string, mn_result->prob[0]);
-                    gpio_set_level(GAT_WAKEUP_ASR_GPIO, 0);
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    gpio_set_level(GAT_WAKEUP_ASR_GPIO, 1);
-                }
+        esp_mn_state_t mn_state = multinet->detect(model_data, res->data);
+        if (mn_state == ESP_MN_STATE_DETECTING) {
+            continue;
+        }
+
+        if (mn_state == ESP_MN_STATE_DETECTED) {
+            esp_mn_results_t *mn_result = multinet->get_results(model_data);
+            if (mn_result) {
+                ESP_LOGI(TAG, "wake detected: %s prob=%f", mn_result->string, mn_result->prob[0]);
+                gpio_set_level(GAT_WAKEUP_ASR_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                gpio_set_level(GAT_WAKEUP_ASR_GPIO, 1);
             }
-        } else {
-            taskYIELD();
+        }
+
+        if (mn_state == ESP_MN_STATE_TIMEOUT) {
+            esp_mn_results_t *mn_result = multinet->get_results(model_data);
+            ESP_LOGI(TAG, "mn timeout, string:%s", mn_result ? mn_result->string : "");
+            multinet->clean(model_data);
         }
     }
     vTaskDelete(NULL);
@@ -887,6 +886,14 @@ static void detectTask(void *arg)
 
 void initSpeechRecog(void)
 {
+    ESP_LOGI(TAG, "heap before AFE: internal=%u psram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) == 0) {
+        ESP_LOGE(TAG, "PSRAM unavailable; enable CONFIG_SPIRAM (AFE/MultiNet need it)");
+        return;
+    }
+
     models = esp_srmodel_init("model");
     if (!models) {
         ESP_LOGE(TAG, "esp_srmodel_init failed");
@@ -896,14 +903,18 @@ void initSpeechRecog(void)
     afe_config_t *afe_config = afe_config_init("MM", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
 #endif
 #ifdef ES7210
-    afe_config_t *afe_config = afe_config_init("MMNN", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    /* 单麦 "M"：具体槽位由 AFE_MIC_SLOT 从四路中选出 */
+    afe_config_t *afe_config = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
 #endif
     if (!afe_config) {
         ESP_LOGE(TAG, "afe_config_init failed");
         return;
     }
+    /* 对齐 skainet 识别质量默认：关 WakeNet、固定单麦通道；无参考麦故关 AEC */
     afe_config->wakenet_init = false;
     afe_config->aec_init = false;
+    afe_config->fixed_first_channel = true;
+    afe_config->fixed_output_channel = true;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     afe_handle = esp_afe_handle_from_config(afe_config);
@@ -916,13 +927,17 @@ void initSpeechRecog(void)
     afe_config_free(afe_config);
     if (!afe_data_local) {
         ESP_LOGE(TAG, "afe create_from_config failed");
+        afe_handle = NULL;
         return;
     }
 
-    xTaskCreatePinnedToCore(feedTask, "feed", 8 * 1024, (void *)afe_data_local, 4, NULL, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    xTaskCreatePinnedToCore(detectTask, "detect", 8 * 1024, (void *)afe_data_local, 6, NULL, 1);
-    ESP_LOGI(TAG, "Speech wakeup initialized (AFE+EN MultiNet, no AEC)");
+    ESP_LOGI(TAG, "heap after AFE: internal=%u psram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    xTaskCreatePinnedToCore(detectTask, "detect", 8 * 1024, (void *)afe_data_local, 5, NULL, 1);
+    xTaskCreatePinnedToCore(feedTask, "feed", 8 * 1024, (void *)afe_data_local, 5, NULL, 0);
+    ESP_LOGI(TAG, "Speech wakeup initialized (AFE+EN MN7+VADNet, fixed ch, no AEC)");
 }
 
 void setWakeWord(const char *wake_word)

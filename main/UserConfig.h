@@ -9,6 +9,8 @@
 
 #define ESP_MN_CH_MODEL                 0 // 中文 MultiNet（拼音命令词，串口 SET_ASR 可改）
 #define ESP_MN_EN_MODEL                 1 // 英文 MultiNet 自定义唤醒词
+/* AFE/命令词只用一路：TDM 槽 0~3，线序 [MIC1][MIC3][MIC2][MIC4] → 0=MIC1 */
+#define AFE_MIC_SLOT                    0
 
 #define RGB_GPIO                        9 //RGB指示灯引脚
 #define RGB_CIRCLE_GPIO                 48 //RGB圆环指示灯引脚
